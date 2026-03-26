@@ -1,41 +1,105 @@
+import json
+import os
 from load_data import load_questions, load_shared_contexts
 
-def build_single_episode():
+# Use the same trick to ensure it saves exactly where you want it
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def build_episodes(num_to_build=10):
     questions_df = load_questions()
     contexts_dict = load_shared_contexts()
     
-    # Select the first test case
-    first_row = questions_df.iloc[0]
+    output_file = os.path.join(BASE_DIR, f"dev_{num_to_build}.jsonl")
     
-    # Use 'shared_context_id' to link to the JSONL data
-    context_id = first_row.get("shared_context_id")
-    end_index = int(first_row.get("end_index_in_shared_context"))
-    
-    full_context = contexts_dict.get(context_id)
-    
-    if full_context is None:
-        raise ValueError(f"Could not find context for ID: {context_id}")
-        
-    # Perform the slice
-    context_before_query = full_context[:end_index]
-    
-    episode = {
-        "question_id": first_row.get("question_id"),
-        "question": first_row.get("question"),
-        "choices": first_row.get("all_options"),
-        "answer": first_row.get("correct_answer"),
-        "sliced_context": context_before_query
-    }
-    
-    return episode
+    with open(output_file, "w") as f:
+        for i in range(num_to_build):
+            row = questions_df.iloc[i]
+            
+            ctx_id = str(row.get("shared_context_id"))
+            end_idx = int(row.get("end_index_in_shared_context"))
+            
+            # 1. Pull the full list of messages
+            full_history_list = contexts_dict.get(ctx_id, [])
+            
+            # 2. Slice the LIST of messages (Perfect precision)
+            sliced_history_list = full_history_list[:end_idx]
+
+            structured_turns = []
+            formatted_string = ""
+            
+            for idx, turn in enumerate(sliced_history_list):
+                role = turn.get("role", "Unknown").capitalize()
+                content = turn.get("content", "")
+                
+                # --- Prefix Cleaning ---
+                # Removes "User: ", "Assistant: ", etc. if they are inside the text
+                prefixes = [f"{role}: ", f"{role.lower()}: ", "System: ", "system: "]
+                clean_text = content
+                for p in prefixes:
+                    if clean_text.startswith(p):
+                        clean_text = clean_text[len(p):]
+                        break
+                
+                clean_text = clean_text.strip()
+                
+                # A. Add to Structured List (For Teammates)
+                structured_turns.append({
+                    "turn_index": idx,
+                    "role": role.lower(),
+                    "content": clean_text
+                })
+
+                # B. Add to Formatted String (For Gemini)
+                formatted_string += f"{role}: {clean_text}\n"
+            
+            # # 3. NOW format the sliced list into a string for the AI
+            # formatted_context = ""
+            # for turn in sliced_history_list:
+            #     role = turn.get("role", "Unknown").capitalize()
+            #     text = turn.get("content", "")
+                
+            #     # We check if the dataset accidentally included "User: " in the text.
+            #     expected_prefix = f"{role}: "
+                
+            #     if text.startswith(expected_prefix):
+            #         # If it did, we chop the duplicate off. 
+            #         text = text[len(expected_prefix):]
+                
+            #     # Now, we safely apply our OWN perfectly uniform label.
+            #     formatted_context += f"{role}: {text}\n"
+            
+            # --- The 100% Complete Dictionary ---
+            episode = {
+                # 1. Identifiers & Tracking
+                "episode_id": int(i),
+                "persona_id": str(row.get("persona_id")),
+                "question_id": str(row.get("question_id")),
+                "shared_context_id": ctx_id,
+                
+                # 2. What the AI needs to read
+                "question": str(row.get("user_question_or_message")),
+                "options": str(row.get("all_options")), 
+                "answer": str(row.get("correct_answer")),
+
+                # The Memory (Two formats)
+                "sliced_context": formatted_string.strip(), # Labeled blob for AI
+                "turns": structured_turns,               
+                
+                # 4. ALL Metadata for your final analysis
+                "question_type": str(row.get("question_type")),
+                "topic": str(row.get("topic")),
+                "context_length_in_tokens": int(row.get("context_length_in_tokens", 0)),
+                "context_length_in_letters": int(row.get("context_length_in_letters", 0)),
+                "distance_to_ref_in_blocks": int(row.get("distance_to_ref_in_blocks", 0)),
+                "distance_to_ref_in_tokens": int(row.get("distance_to_ref_in_tokens", 0)),
+                "num_irrelevant_tokens": int(row.get("num_irrelevant_tokens", 0)),
+                "distance_to_ref_proportion_in_context": float(str(row.get("distance_to_ref_proportion_in_context", "0.0")).replace("%", "")) / 100,   
+                "end_index_in_shared_context": end_idx
+            }
+            
+            f.write(json.dumps(episode) + "\n")
+            
+    print(f"Success: Created {num_to_build} episodes at {output_file}")
 
 if __name__ == "__main__":
-    try:
-        episode = build_single_episode()
-        print("\n[SUCCESS] Episode Built!")
-        print(f"QUESTION: {episode['question']}")
-        print(f"CORRECT ANSWER: {episode['answer']}")
-        print("\n--- START OF CHAT ---")
-        print(episode['sliced_context'][:500] + "...")
-    except Exception as e:
-        print(f"[ERROR] {e}")
+    build_episodes(10)
