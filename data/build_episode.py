@@ -1,6 +1,6 @@
 import json
 import os
-from load_data import load_questions, load_shared_contexts
+from data.load_data import load_questions, load_shared_contexts
 
 # Use the same trick to ensure it saves exactly where you want it
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
