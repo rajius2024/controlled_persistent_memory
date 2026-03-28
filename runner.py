@@ -1,3 +1,29 @@
+"""
+No-Memory Baseline Runner
+=========================
+Lead: Aravindan Chidambaram
+
+What this does:
+- Loads 10 pre-built episodes from data/dev_10.jsonl
+- For each episode, sends the raw sliced conversation context + question to Groq (Llama 3.3)
+- Records whether the predicted answer matches the correct answer
+- Reports overall accuracy
+
+Usage:
+    export GROQ_API_KEY="your_key_here"
+    python runner.py
+
+Results (dev_10, no memory):
+    Accuracy: 6/10 = 60.00%
+
+Dependencies:
+    pip install groq
+    
+Notes:
+- Context is truncated to last 8000 chars to stay under Groq's 12k token limit
+- Answer matching strips parentheses before comparing (e.g. '(c)' == 'c')
+- Rate limit: 1.5s sleep between requests
+"""
 import os
 import json
 import time
