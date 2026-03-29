@@ -6,3 +6,11 @@ venv/
 __pycache__/
 *.pyc
 runs/
+.env
+__pycache__/
+*.pyc
+data/questions_32k.csv
+data/questions_32k.csv
+data/shared_contexts_32k.jsonl
+results/
+__pycache__/

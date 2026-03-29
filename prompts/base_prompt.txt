@@ -1,0 +1,16 @@
+You are a helpful assistant.
+
+Use the CONTEXT to answer the QUESTION.
+Choose the best option from the OPTIONS.
+Reply with just the answer letter (a/b/c/d) only.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+OPTIONS:
+{options}
+
+Answer:
