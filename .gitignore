@@ -2,6 +2,10 @@ data/*.csv
 data/*.jsonl
 data/*.csv
 data/*.jsonl
+venv/
+__pycache__/
+*.pyc
+runs/
 .env
 __pycache__/
 *.pyc
