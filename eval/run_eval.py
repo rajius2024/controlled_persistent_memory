@@ -1,13 +1,8 @@
 # eval/run_eval.py
+import argparse
 import json
 import os
-import re
-import time
-from datetime import datetime, timezone
-
-from groq import Groq
-
-from eval.scoring import is_correct, normalize_label
+from utils.llm import call_llm, normalize_label, is_correct
 
 
 def iter_jsonl(path: str):
@@ -17,154 +12,129 @@ def iter_jsonl(path: str):
                 yield json.loads(line)
 
 
-# Groq client
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
-
-def call_llm(prompt: str) -> str:
+class NoMemoryMethod:
     """
-    Call model via Groq and return text.
-    Prints errors so we can debug instead of silently failing.
+    No-memory baseline using shared utils.llm call_llm().
+    Uses sliced_context (truncated) + question + options.
     """
-    try:
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=8,
-            temperature=0.0,
-        )
 
-        # Defensive parsing
-        if not resp or not getattr(resp, "choices", None):
-            print("[LLM ERROR] Empty response object")
-            return ""
-
-        msg = resp.choices[0].message if resp.choices else None
-        content = (msg.content or "").strip() if msg else ""
-
-        if not content:
-            print("[LLM WARN] Model returned empty content")
-        return content
-
-    except Exception as e:
-        print(f"[LLM ERROR] {type(e).__name__}: {e}")
-        time.sleep(2)
-        return ""
-
-
-def extract_choice_label(text: str) -> str:
-    """
-    Convert model output into canonical label: (a)/(b)/(c)/(d).
-    Handles outputs like:
-      - "(c)"
-      - "c"
-      - "Answer: (c)"
-      - "The answer is c"
-    Returns "" if not found.
-    """
-    if not text:
-        return ""
-
-    s = text.strip().lower()
-
-    # Prefer explicit (a)/(b)/(c)/(d)
-    m = re.search(r"\(([a-d])\)", s)
-    if m:
-        return f"({m.group(1)})"
-
-    # Fallback to standalone letter
-    m = re.search(r"\b([a-d])\b", s)
-    if m:
-        return f"({m.group(1)})"
-
-    # Final fallback: remove non a-d and take first char if any remains
-    letter = re.sub(r"[^a-d]", "", s)[:1]
-    return f"({letter})" if letter else ""
-
-
-class NoMemoryGroq:
-    def __init__(
-        self,
-        sleep_s: float = 1.5,
-        context_cap_chars: int = 8000,
-        options_cap_chars: int = 2500,
-    ):
-        self.sleep_s = sleep_s
+    def __init__(self, context_cap_chars: int = 8000, options_cap_chars: int = 2500):
         self.context_cap_chars = context_cap_chars
         self.options_cap_chars = options_cap_chars
 
-    def build_prompt(self, episode: dict) -> str:
-        context = (episode.get("sliced_context", "") or "")[-self.context_cap_chars:]
-        options = (episode.get("options", "") or "")[:self.options_cap_chars]
-        question = episode.get("question", "") or ""
+    def answer(self, ep: dict):
+        context = (ep.get("sliced_context", "") or "")[-self.context_cap_chars:]
+        options = (ep.get("options", "") or "")[:self.options_cap_chars]
+        question = ep.get("question", "") or ""
 
-        # Stricter format request (helps compliance a lot)
-        return (
+        prompt = (
             f"Conversation history:\n{context}\n\n"
             f"Question: {question}\n"
-            f"Options: {options}\n"
+            f"Options:\n{options}\n\n"
             f"Output format must be EXACTLY one of: (a) (b) (c) (d). No other text."
         )
 
-    def answer(self, episode: dict) -> tuple[str, str]:
-        """
-        Returns:
-          (prediction_label, raw_model_text)
-        """
-        prompt = self.build_prompt(episode)
-        raw = call_llm(prompt)
+        raw_text = call_llm(prompt)
+        pred = normalize_label(raw_text)
+        return pred, raw_text, [], []
 
-        pred = extract_choice_label(raw)
 
-        time.sleep(self.sleep_s)
-        return pred, raw
+class VanillaRAGMethod:
+    """
+    Vanilla RAG baseline wrapper that reuses Aravindan's retrieval pipeline:
+      - embed_with_cache() from baselines.embeddings
+      - retrieve_top_k() + build_prompt() from baselines.vanilla_rag
+    """
+
+    def __init__(self, top_k: int = 15):
+        self.top_k = top_k
+
+        # Lazy imports (only needed when vanilla_rag is selected)
+        from baselines.embeddings import embed_with_cache
+        from baselines.vanilla_rag import retrieve_top_k, build_prompt
+
+        self.embed_with_cache = embed_with_cache
+        self.retrieve_top_k = retrieve_top_k
+        self.build_prompt = build_prompt
+
+    def answer(self, ep: dict):
+        turns = ep.get("turns", [])
+        if not turns:
+            return "", "", [], []
+
+        # 1) Embed all turns
+        texts = [f"{t['role'].capitalize()}: {t['content']}" for t in turns]
+        embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id','')}")
+
+        # 2) Retrieve
+        enhanced_query = f"{ep.get('question','')} {ep.get('options','')}"
+        retrieved = self.retrieve_top_k(enhanced_query, turns, embeddings, k=self.top_k)
+
+        # 3) Prompt + LLM
+        prompt = self.build_prompt(ep, retrieved)
+        raw_text = call_llm(prompt)
+        pred = normalize_label(raw_text)
+
+        retrieved_texts = [r["text"] for r in retrieved]
+        retrieved_scores = [r["sim_score"] for r in retrieved]
+        return pred, raw_text, retrieved_texts, retrieved_scores
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", choices=["no_memory", "vanilla_rag"], required=True)
+    parser.add_argument("--top_k", type=int, default=15, help="Top-k retrieval for vanilla_rag")
+    parser.add_argument("--episodes_path", type=str, default=os.path.join("data", "dev_10.jsonl"))
+    args = parser.parse_args()
+
     os.makedirs("results", exist_ok=True)
 
-    episodes_path = os.path.join("data", "dev_10.jsonl")
-    out_path = os.path.join("results", "no_memory_dev10.jsonl")
-
-    method = NoMemoryGroq()
+    if args.method == "no_memory":
+        method = NoMemoryMethod()
+        out_path = os.path.join("results", "no_memory_dev10.jsonl")
+        top_k = 0
+    else:
+        method = VanillaRAGMethod(top_k=args.top_k)
+        out_path = os.path.join("results", "vanilla_rag_dev10.jsonl")
+        top_k = args.top_k
 
     correct = 0
     total = 0
 
     with open(out_path, "w", encoding="utf-8") as out:
-        for ep in iter_jsonl(episodes_path):
-            pred_label, raw_text = method.answer(ep)
-            gold_raw = ep.get("answer", "")
+        for ep in iter_jsonl(args.episodes_path):
+            pred, raw_text, retrieved_texts, retrieved_scores = method.answer(ep)
 
-            # Debug first 2 episodes so you can see what the model returned
-            if ep.get("episode_id") in [0, 1]:
-                print(f"[DEBUG ep {ep.get('episode_id')}] raw_model_text={repr(raw_text)} pred={pred_label} gold={gold_raw}")
+            gold = normalize_label(ep.get("answer", ""))
+            correct_flag = is_correct(pred, gold)
+            correct += int(correct_flag)
+            total += 1
 
-            rec = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+            record = {
+                # match Aravindan vanilla_rag schema
                 "episode_id": ep.get("episode_id"),
-                "method": "no_memory_groq_openai_gpt-oss-120b",
-                "prediction_raw": raw_text,          # store the real raw model output
-                "prediction": normalize_label(pred_label),
-                "gold_raw": gold_raw,
-                "gold": normalize_label(gold_raw),
-                "correct": is_correct(pred_label, gold_raw),
+                "question_id": ep.get("question_id"),
+                "method": args.method,
 
-                # placeholders for later
-                "retrieved": [],
-                "retrieved_scores": [],
-                "stored_count": 0,
-                "retrieved_count": 0,
+                "prediction_raw": raw_text,
+                "prediction": pred,
+                "gold_raw": ep.get("answer", ""),
+                "gold": gold,
+                "correct": correct_flag,
+
+                "retrieved": retrieved_texts,
+                "retrieved_scores": retrieved_scores,
+                "stored_count": len(ep.get("turns", [])) if args.method == "vanilla_rag" else 0,
+                "retrieved_count": len(retrieved_texts),
                 "superseded_count": 0,
 
-                # metadata for later breakdowns
                 "question_type": ep.get("question_type"),
-                "topic": ep.get("topic"),
+                "topic": ep.get("topic", ""),
+
+                "top_k": top_k,
             }
 
-            out.write(json.dumps(rec) + "\n")
-            total += 1
-            correct += int(rec["correct"])
+            out.write(json.dumps(record) + "\n")
 
     acc = correct / total if total else 0.0
     print(f"Accuracy: {correct}/{total} = {acc:.3f}")
