@@ -5,14 +5,21 @@ from data.load_data import load_questions, load_shared_contexts
 # Use the same trick to ensure it saves exactly where you want it
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def build_episodes(num_to_build=10):
+def build_episodes(num_to_build=None):
     questions_df = load_questions()
     contexts_dict = load_shared_contexts()
+
+    # DYNAMIC LOGIC: Use provided number or the length of the dataframe
+    total_available = len(questions_df)
+    limit = num_to_build if num_to_build is not None else total_available
     
-    output_file = os.path.join(BASE_DIR, f"dev_{num_to_build}.jsonl")
+    # Ensure we don't try to build more than we have
+    limit = min(limit, total_available)
     
-    with open(output_file, "w") as f:
-        for i in range(num_to_build):
+    output_file = os.path.join(BASE_DIR, "dev_latest.jsonl")
+    
+    with open(output_file, "w", encoding='utf-8') as f:
+        for i in range(limit):
             row = questions_df.iloc[i]
             
             ctx_id = str(row.get("shared_context_id"))
@@ -22,7 +29,7 @@ def build_episodes(num_to_build=10):
             full_history_list = contexts_dict.get(ctx_id, [])
             
             # 2. Slice the LIST of messages (Perfect precision)
-            sliced_history_list = full_history_list[:end_idx]
+            sliced_history_list = full_history_list[:max(0, end_idx - 1)]
 
             structured_turns = []
             formatted_string = ""
@@ -99,7 +106,7 @@ def build_episodes(num_to_build=10):
             
             f.write(json.dumps(episode) + "\n")
             
-    print(f"Success: Created {num_to_build} episodes at {output_file}")
+    print(f"Success: Created {limit} episodes in 'dev_latest.jsonl' ")
 
 if __name__ == "__main__":
     build_episodes(10)

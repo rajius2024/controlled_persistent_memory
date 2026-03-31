@@ -3,7 +3,7 @@ import os
 
 # Identify the file location dynamically within the /data folder
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE_PATH = os.path.join(BASE_DIR, "dev_10.jsonl")
+FILE_PATH = os.path.join(BASE_DIR, "dev_latest.jsonl")
 
 def validate():
     if not os.path.exists(FILE_PATH):
@@ -26,7 +26,7 @@ def validate():
         "distance_to_ref_proportion_in_context": float
     }
 
-    print(f"🔍 Starting Deep Sanity Check on {os.path.basename(FILE_PATH)}...")
+    print(f"Starting Deep Sanity Check on {os.path.basename(FILE_PATH)}...")
 
     with open(FILE_PATH, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
@@ -53,8 +53,9 @@ def validate():
 
                 # 4. ORDERING & DATA LEAKAGE CHECKS
                 cutoff = ep["end_index_in_shared_context"]
-                if len(ep["turns"]) != cutoff:
-                    raise ValueError(f"Cutoff mismatch: Has {len(ep['turns'])} turns, expected {cutoff}")
+                expected_count = max(0, cutoff - 1)
+                if len(ep["turns"]) != expected_count:
+                    raise ValueError(f"Cutoff mismatch: Has {len(ep['turns'])} turns, expected {expected_count} (Original Index: {cutoff})")
 
                 for idx, turn in enumerate(ep["turns"]):
                     # Verify ordering is preserved
@@ -75,7 +76,7 @@ def validate():
                 print(f"Episode {i} FAILED: {e}")
                 return # Stop immediately if data is corrupted
 
-    print("\n DATA IS READY")
+    print("\n DATA IS READY: All records passed validation.")
 
 if __name__ == "__main__":
     validate()
