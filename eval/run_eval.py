@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+
 from utils.llm import call_llm, normalize_label, is_correct
 
 
@@ -41,15 +42,12 @@ class NoMemoryMethod:
 
 class VanillaRAGMethod:
     """
-    Vanilla RAG baseline wrapper that reuses Aravindan's retrieval pipeline:
-      - embed_with_cache() from baselines.embeddings
-      - retrieve_top_k() + build_prompt() from baselines.vanilla_rag
+    Vanilla RAG baseline wrapper that reuses the shared retrieval pipeline.
     """
 
     def __init__(self, top_k: int = 15):
         self.top_k = top_k
 
-        # Lazy imports (only needed when vanilla_rag is selected)
         from baselines.embeddings import embed_with_cache
         from baselines.vanilla_rag import retrieve_top_k, build_prompt
 
@@ -62,15 +60,12 @@ class VanillaRAGMethod:
         if not turns:
             return "", "", [], []
 
-        # 1) Embed all turns
         texts = [f"{t['role'].capitalize()}: {t['content']}" for t in turns]
-        embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id','')}")
+        embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id', '')}")
 
-        # 2) Retrieve
-        enhanced_query = f"{ep.get('question','')} {ep.get('options','')}"
+        enhanced_query = f"{ep.get('question', '')} {ep.get('options', '')}"
         retrieved = self.retrieve_top_k(enhanced_query, turns, embeddings, k=self.top_k)
 
-        # 3) Prompt + LLM
         prompt = self.build_prompt(ep, retrieved)
         raw_text = call_llm(prompt)
         pred = normalize_label(raw_text)
@@ -82,8 +77,8 @@ class VanillaRAGMethod:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", choices=["no_memory", "vanilla_rag"], required=True)
-    parser.add_argument("--top_k", type=int, default=15, help="Top-k retrieval for vanilla_rag")
+    parser.add_argument("--method", choices=["no_memory", "vanilla_rag", "controlled"], required=True)
+    parser.add_argument("--top_k", type=int, default=15, help="Top-k retrieval for retrieval-based methods")
     parser.add_argument("--episodes_path", type=str, default=os.path.join("data", "dev_10.jsonl"))
     args = parser.parse_args()
 
@@ -93,10 +88,24 @@ def main():
         method = NoMemoryMethod()
         out_path = os.path.join("results", "no_memory_dev10.jsonl")
         top_k = 0
-    else:
+
+    elif args.method == "vanilla_rag":
         method = VanillaRAGMethod(top_k=args.top_k)
         out_path = os.path.join("results", "vanilla_rag_dev10.jsonl")
         top_k = args.top_k
+
+    elif args.method == "controlled":
+        from eval.methods.controlled import ControlledMethod
+
+        method = ControlledMethod(
+            run_root=os.path.join("results", "controlled_runs"),
+            top_k=args.top_k,
+        )
+        out_path = os.path.join("results", "controlled_dev10.jsonl")
+        top_k = args.top_k
+
+    else:
+        raise ValueError(f"Unsupported method: {args.method}")
 
     correct = 0
     total = 0
@@ -110,27 +119,29 @@ def main():
             correct += int(correct_flag)
             total += 1
 
+            stored_count = len(ep.get("turns", [])) if args.method == "vanilla_rag" else 0
+            superseded_count = 0
+
+            if args.method == "controlled" and getattr(method, "last_trace", None):
+                stored_count = method.last_trace.get("stored_memories_count", 0)
+                superseded_count = method.last_trace.get("superseded_count", 0)
+
             record = {
-                # match Aravindan vanilla_rag schema
                 "episode_id": ep.get("episode_id"),
                 "question_id": ep.get("question_id"),
                 "method": args.method,
-
                 "prediction_raw": raw_text,
                 "prediction": pred,
                 "gold_raw": ep.get("answer", ""),
                 "gold": gold,
                 "correct": correct_flag,
-
                 "retrieved": retrieved_texts,
                 "retrieved_scores": retrieved_scores,
-                "stored_count": len(ep.get("turns", [])) if args.method == "vanilla_rag" else 0,
+                "stored_count": stored_count,
                 "retrieved_count": len(retrieved_texts),
-                "superseded_count": 0,
-
+                "superseded_count": superseded_count,
                 "question_type": ep.get("question_type"),
                 "topic": ep.get("topic", ""),
-
                 "top_k": top_k,
             }
 
