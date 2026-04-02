@@ -112,7 +112,7 @@ class ChromaMemoryStore(MemoryStore):
     def _record_to_metadata(self, record: MemoryRecord) -> dict[str, Any]:
         status_value = record.status.value if isinstance(record.status, MemoryStatus) else str(record.status)
 
-        return {
+        metadata = {
             "persona_id": record.persona_id,
             "turn_index": record.turn_index,
             "status": status_value,
@@ -122,8 +122,9 @@ class ChromaMemoryStore(MemoryStore):
 
         if record.supersession_link is not None:
             metadata["supersession_link"] = record.supersession_link
-        return metadata
 
+        return metadata
+    
     def _row_to_record(
         self,
         memory_id: str,
