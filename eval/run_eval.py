@@ -63,8 +63,9 @@ class VanillaRAGMethod:
             return "", "", [], []
 
         # 1) Embed all turns
+        # CORRECT - turns are already sliced, embed exactly what we have
         texts = [f"{t['role'].capitalize()}: {t['content']}" for t in turns]
-        embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id','')}")
+        embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id', '')}_sliced")
 
         # 2) Retrieve
         enhanced_query = f"{ep.get('question','')} {ep.get('options','')}"
@@ -84,7 +85,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", choices=["no_memory", "vanilla_rag"], required=True)
     parser.add_argument("--top_k", type=int, default=15, help="Top-k retrieval for vanilla_rag")
-    parser.add_argument("--episodes_path", type=str, default=os.path.join("data", "dev_10.jsonl"))
+    parser.add_argument("--episodes_path", type=str, default=os.path.join("data", "dev_latest.jsonl"))
     args = parser.parse_args()
 
     os.makedirs("results", exist_ok=True)

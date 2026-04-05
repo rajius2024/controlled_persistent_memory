@@ -43,7 +43,9 @@ def retrieve_top_k(
     """Retrieve top-k turns using cosine similarity + recency boost."""
     if embeddings is None or len(turns) == 0:
         return []
-
+    # Safety: trim stale cache if lengths don't match
+    if len(embeddings) != len(turns):
+        embeddings = embeddings[:len(turns)]
     k          = min(k, len(turns))
     query_vec  = embed_one(query)
     sim_scores = cosine_similarity(query_vec, embeddings)
@@ -172,7 +174,7 @@ def run_vanilla_rag(episodes: list[dict], top_k: int = TOP_K) -> dict:
 
 
 if __name__ == "__main__":
-    episodes_path = os.path.join("data", "dev_10.jsonl")
+    episodes_path = os.path.join("data", "dev_latest.jsonl")
     print(f"Loading episodes from {episodes_path}...")
     episodes = []
     with open(episodes_path) as f:
