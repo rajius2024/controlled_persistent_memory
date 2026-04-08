@@ -109,4 +109,4 @@ def build_episodes(num_to_build=None):
     print(f"Success: Created {limit} episodes in 'dev_latest.jsonl' ")
 
 if __name__ == "__main__":
-    build_episodes(10)
+    build_episodes(50)
