@@ -19,12 +19,13 @@ class NoMemoryMethod:
     Uses sliced_context (truncated) + question + options.
     """
 
-    def __init__(self, context_cap_chars: int = 8000, options_cap_chars: int = 2500):
-        self.context_cap_chars = context_cap_chars
+    def __init__(self, k: int = 15, token_cap: int = 8000, options_cap_chars: int = 2500):
+        self.k = k
+        self.token_cap = token_cap
         self.options_cap_chars = options_cap_chars
 
     def answer(self, ep: dict):
-        context = (ep.get("sliced_context", "") or "")[-self.context_cap_chars:]
+        context = (ep.get("sliced_context", "") or "")[-self.token_cap:]
         options = (ep.get("options", "") or "")[:self.options_cap_chars]
         question = ep.get("question", "") or ""
 
@@ -37,7 +38,7 @@ class NoMemoryMethod:
 
         raw_text = call_llm(prompt)
         pred = normalize_label(raw_text)
-        return pred, raw_text, [], []
+        return pred, raw_text, [], [], 0, 0
 
 
 class VanillaRAGMethod:
@@ -45,8 +46,9 @@ class VanillaRAGMethod:
     Vanilla RAG baseline wrapper that reuses the shared retrieval pipeline.
     """
 
-    def __init__(self, top_k: int = 15):
-        self.top_k = top_k
+    def __init__(self, k: int = 15, token_cap: int = 8000):
+        self.k = k
+        self.token_cap = token_cap
 
         from baselines.embeddings import embed_with_cache
         from baselines.vanilla_rag import retrieve_top_k, build_prompt
@@ -58,13 +60,13 @@ class VanillaRAGMethod:
     def answer(self, ep: dict):
         turns = ep.get("turns", [])
         if not turns:
-            return "", "", [], []
+            return "", "", [], [], 0, 0
 
         texts = [f"{t['role'].capitalize()}: {t['content']}" for t in turns]
         embeddings = self.embed_with_cache(texts, cache_key=f"ep_{ep.get('question_id', '')}")
 
         enhanced_query = f"{ep.get('question', '')} {ep.get('options', '')}"
-        retrieved = self.retrieve_top_k(enhanced_query, turns, embeddings, k=self.top_k)
+        retrieved = self.retrieve_top_k(enhanced_query, turns, embeddings, k=self.k)
 
         prompt = self.build_prompt(ep, retrieved)
         raw_text = call_llm(prompt)
@@ -72,47 +74,85 @@ class VanillaRAGMethod:
 
         retrieved_texts = [r["text"] for r in retrieved]
         retrieved_scores = [r["sim_score"] for r in retrieved]
-        return pred, raw_text, retrieved_texts, retrieved_scores
+        stored_count = len(turns)
+        superseded_count = 0
+
+        return pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count
+
+
+
+def build_output_path(method_name: str, out_dir: str) -> str:
+    filename_map = {
+        "no_memory": "no_memory_dev10.jsonl",
+        "vanilla_rag": "vanilla_rag_dev10.jsonl",
+        "controlled": "controlled_dev10.jsonl",
+    }
+    return os.path.join(out_dir, filename_map[method_name])
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", choices=["no_memory", "vanilla_rag", "controlled"], required=True)
-    parser.add_argument("--top_k", type=int, default=15, help="Top-k retrieval for retrieval-based methods")
-    parser.add_argument("--episodes_path", type=str, default=os.path.join("data", "dev_10.jsonl"))
+    parser.add_argument(
+        "--method",
+        choices=["no_memory", "vanilla_rag", "controlled"],
+        required=True,
+        help="Method to run",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=15,
+        help="Top-k retrieval for retrieval-based methods",
+    )
+    parser.add_argument(
+        "--token_cap",
+        type=int,
+        default=8000,
+        help="Character cap for context used in prompt construction",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="results",
+        help="Directory to write output jsonl logs",
+    )
+    parser.add_argument(
+        "--episodes_path",
+        type=str,
+        default=os.path.join("data", "dev_latest.jsonl"),
+        help="Path to episode dataset jsonl",
+    )
     args = parser.parse_args()
 
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
 
     if args.method == "no_memory":
-        method = NoMemoryMethod()
-        out_path = os.path.join("results", "no_memory_dev10.jsonl")
-        top_k = 0
-
+        method = NoMemoryMethod(k=args.k, token_cap=args.token_cap)
     elif args.method == "vanilla_rag":
-        method = VanillaRAGMethod(top_k=args.top_k)
-        out_path = os.path.join("results", "vanilla_rag_dev10.jsonl")
-        top_k = args.top_k
-
-    elif args.method == "controlled":
-        from eval.methods.controlled import ControlledMethod
-
-        method = ControlledMethod(
-            run_root=os.path.join("results", "controlled_runs"),
-            top_k=args.top_k,
-        )
-        out_path = os.path.join("results", "controlled_dev10.jsonl")
-        top_k = args.top_k
-
+        method = VanillaRAGMethod(k=args.k, token_cap=args.token_cap)
     else:
-        raise ValueError(f"Unsupported method: {args.method}")
+        from eval.methods.controlled import ControlledMethod
+        method = ControlledMethod(
+            run_root=os.path.join(args.out_dir, "controlled_runs"),
+            top_k=args.k,
+        )
+
+    out_path = build_output_path(args.method, args.out_dir)
+
 
     correct = 0
     total = 0
 
     with open(out_path, "w", encoding="utf-8") as out:
         for ep in iter_jsonl(args.episodes_path):
-            pred, raw_text, retrieved_texts, retrieved_scores = method.answer(ep)
+            (
+                pred,
+                raw_text,
+                retrieved_texts,
+                retrieved_scores,
+                stored_count,
+                superseded_count,
+            ) = method.answer(ep)
 
             gold = normalize_label(ep.get("answer", ""))
             correct_flag = is_correct(pred, gold)
@@ -142,7 +182,8 @@ def main():
                 "superseded_count": superseded_count,
                 "question_type": ep.get("question_type"),
                 "topic": ep.get("topic", ""),
-                "top_k": top_k,
+                "k": args.k,
+                "token_cap": args.token_cap,
             }
 
             out.write(json.dumps(record) + "\n")
