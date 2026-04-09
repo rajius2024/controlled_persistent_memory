@@ -43,3 +43,65 @@ To ensure a valid evaluation, a **-1 turn buffer** is applied to all episodes:
 - **Status:** **PASSED**
 - **Date:** March 30, 2026
 - **Verification:** Automated check_leakage.py and manual spot checks confirmed zero literal string leakage of the question text into the sliced_context.
+
+SCENARIO BREAKDOWN VARIABLES: 
+
+1. topic
+
+Simple Explanation: The subject of the conversation (e.g., Travel, Finance, or Music).
+
+Why we chose this: To identify if the memory system has "blind spots" in specific domains. It reveals if the model is more reliable when remembering financial details versus creative hobbies.
+
+2. question_type
+
+Simple Explanation: Whether the answer requires simple fact retrieval (Recall) or connecting multiple pieces of information (Reasoning).
+
+Why we chose this: To measure the "intelligence" of the retrieval process. It distinguishes between a system that can only repeat text and one that truly understands complex logic.
+
+3. context_length_in_tokens
+
+Simple Explanation: The total word count of the conversation history provided to the AI.
+
+Why we chose this: Every AI has a capacity limit. This allows the team to pinpoint the exact "breaking point" where the history becomes too large for the system to process accurately.
+
+4. distance_to_ref_in_tokens
+
+Simple Explanation: How many words have passed between the mention of the answer and the user's question.
+
+Why we chose this: This is the "Needle in a Haystack" test. It determines the effective range of the memory—showing if it is harder to find a fact from 5,000 words ago versus 500 words ago.
+
+5. distance_to_ref_in_blocks
+
+Simple Explanation: The number of back-and-forth turns between the answer and the question.
+
+Why we chose this: Sometimes the number of interactions causes more memory decay than the word count. This identifies if frequent topic changes during the chat overwhelm the system.
+
+6. distance_to_ref_proportion_in_context
+
+Simple Explanation: The relative location of the answer in the file (0.0 = Start, 0.5 = Middle, 1.0 = End).
+
+Why we chose this: To detect "Positional Bias." It mathematically proves if the system suffers from "Lost-in-the-Middle" syndrome, where it forgets information placed in the center of a long chat.
+
+7. num_irrelevant_tokens
+
+Simple Explanation: The amount of "small talk" or filler text that is unrelated to the answer.
+
+Why we chose this: To measure "Noise Robustness." It tests the system's focus and its ability to ignore conversational distractions to find the one relevant fact.
+
+8. end_index_in_shared_context
+
+Simple Explanation: The total "age" of the conversation (e.g., is this Turn 10 or Turn 200?).
+
+Why we chose this: To test for "Relationship Maturity." It determines if the memory system remains sharp and reliable over the course of a long-term, multi-day history.
+
+9. persona_id
+
+Simple Explanation: The specific identity and profile of the user (Gender, Race, Job, etc.).
+
+Why we chose this: This is the "Fairness Audit." It ensures the system provides an equal quality of service to all users, regardless of their demographic background or profession.
+
+10. context_length_in_letters
+
+Simple Explanation: The literal character count of the conversation history.
+
+Why we chose this: To track the "Physical Scale" of the data. This is used to compare database efficiency and processing speed against the token-based performance of the AI.
