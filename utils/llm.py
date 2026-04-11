@@ -20,13 +20,19 @@ import time
 from groq import Groq
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL            = "llama-3.3-70b-versatile"
+MODEL            = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_TOKENS       = 8
 TEMPERATURE      = 0.0
 MAX_RETRIES      = 3
-RATE_LIMIT_SLEEP = 2.0
+RATE_LIMIT_SLEEP = 5.0
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    return _client
 
 
 # ── LLM Call ──────────────────────────────────────────────────────────────────
@@ -55,7 +61,7 @@ def call_llm(prompt: str, system: str = None) -> str:
 
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.chat.completions.create(
+            resp = _get_client().chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 max_tokens=MAX_TOKENS,
@@ -71,6 +77,7 @@ def call_llm(prompt: str, system: str = None) -> str:
 
         except Exception as e:
             err = str(e)
+            print(f"  [DEBUG] Exception type: {type(e).__name__}, message: {err[:200]}")
             if "413" in err or "429" in err or "rate_limit" in err.lower():
                 wait = 15 * (attempt + 1)
                 print(f"  [RATE LIMIT] Waiting {wait}s... (attempt {attempt+1}/{MAX_RETRIES})")
