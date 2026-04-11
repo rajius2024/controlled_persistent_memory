@@ -100,8 +100,6 @@ class ChromaMemoryStore(MemoryStore):
             metadatas=[updated_metadata],
         )
 
-    # ---------- helpers ----------
-
     def _record_to_payload(self, record: MemoryRecord) -> dict[str, Any]:
         return {
             "id": record.memory_id,
@@ -123,14 +121,19 @@ class ChromaMemoryStore(MemoryStore):
         if record.supersession_link is not None:
             metadata["supersession_link"] = record.supersession_link
 
+        for key, value in record.metadata.items():
+            metadata[key] = value
+
         return metadata
-    
+
     def _row_to_record(
         self,
         memory_id: str,
         document: str,
         metadata: dict[str, Any],
     ) -> MemoryRecord:
+        base_metadata = dict(metadata)
+
         return MemoryRecord(
             memory_id=memory_id,
             persona_id=metadata["persona_id"],
@@ -140,7 +143,7 @@ class ChromaMemoryStore(MemoryStore):
             memory_type=metadata["memory_type"],
             time_marker=metadata["time_marker"],
             supersession_link=metadata.get("supersession_link"),
-            metadata={},
+            metadata=base_metadata,
         )
 
     def _build_where_filter(

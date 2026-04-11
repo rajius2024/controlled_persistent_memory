@@ -14,25 +14,27 @@ def build_controlled_store_from_episode(
     store: MemoryStore,
     run_dir: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Process turns sequentially:
-    - write router proposes memories
-    - versioning decides supersession
-    - store persists active records
-    """
     persona_id = str(episode["persona_id"])
     turns = episode.get("turns", [])
 
     stored_records: list[MemoryRecord] = []
     superseded_ids: list[str] = []
+    contradiction_count = 0
+    duplicate_hits = 0
 
     for turn in turns:
         candidate_records = extract_memories_from_turn(turn, persona_id)
 
         for record in candidate_records:
             result = add_memory(record, store)
+
+            if not result.wrote_new:
+                duplicate_hits += 1
+                continue
+
             stored_records.append(result.stored_record)
             superseded_ids.extend(result.superseded_ids)
+            contradiction_count += result.contradiction_count
 
             if run_dir is not None:
                 log_write_event(
@@ -44,6 +46,14 @@ def build_controlled_store_from_episode(
                         "stored_memory_id": result.stored_record.memory_id,
                         "stored_text": result.stored_record.normalized_mem_text,
                         "memory_type": result.stored_record.memory_type,
+                        "slot": result.stored_record.metadata.get("slot"),
+                        "polarity": result.stored_record.metadata.get("polarity"),
+                        "target_kind": result.stored_record.metadata.get("target_kind"),
+                        "write_score": result.stored_record.metadata.get("write_score"),
+                        "preference_signal": result.stored_record.metadata.get("preference_signal"),
+                        "procedural_signal": result.stored_record.metadata.get("procedural_signal"),
+                        "ephemeral_penalty": result.stored_record.metadata.get("ephemeral_penalty"),
+                        "extraction_reason": result.stored_record.metadata.get("extraction_reason"),
                         "conflict_bucket": result.conflict_bucket,
                     },
                 )
@@ -58,6 +68,9 @@ def build_controlled_store_from_episode(
                             "old_memory_id": old_id,
                             "new_memory_id": result.stored_record.memory_id,
                             "new_text": result.stored_record.normalized_mem_text,
+                            "slot": result.stored_record.metadata.get("slot"),
+                            "polarity": result.stored_record.metadata.get("polarity"),
+                            "target_kind": result.stored_record.metadata.get("target_kind"),
                         },
                     )
 
@@ -66,4 +79,6 @@ def build_controlled_store_from_episode(
         "stored_count": len(stored_records),
         "superseded_ids": superseded_ids,
         "superseded_count": len(superseded_ids),
+        "contradiction_count": contradiction_count,
+        "duplicate_hits": duplicate_hits,
     }

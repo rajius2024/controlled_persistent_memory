@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import time
 
 from utils.llm import call_llm, normalize_label, is_correct
 
@@ -76,9 +77,8 @@ class VanillaRAGMethod:
         retrieved_scores = [r["sim_score"] for r in retrieved]
         stored_count = len(turns)
         superseded_count = 0
-
         return pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count
-
+        
 
 
 def build_output_path(method_name: str, out_dir: str) -> str:
@@ -142,29 +142,26 @@ def main():
 
     correct = 0
     total = 0
-
     with open(out_path, "w", encoding="utf-8") as out:
         for ep in iter_jsonl(args.episodes_path):
-            (
-                pred,
-                raw_text,
-                retrieved_texts,
-                retrieved_scores,
-                stored_count,
-                superseded_count,
-            ) = method.answer(ep)
-
+            start = time.time()
+            pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count = method.answer(ep)
+            elapsed = time.time() - start
+            print(f"[eval] episode {ep.get('episode_id')} took {elapsed:.2f}s", flush=True)
             gold = normalize_label(ep.get("answer", ""))
             correct_flag = is_correct(pred, gold)
             correct += int(correct_flag)
             total += 1
 
-            stored_count = len(ep.get("turns", [])) if args.method == "vanilla_rag" else 0
-            superseded_count = 0
+            contradiction_count = 0
 
-            if args.method == "controlled" and getattr(method, "last_trace", None):
+            if args.method == "vanilla_rag":
+                stored_count = len(ep.get("turns", []))
+
+            elif args.method == "controlled" and getattr(method, "last_trace", None):
                 stored_count = method.last_trace.get("stored_memories_count", 0)
                 superseded_count = method.last_trace.get("superseded_count", 0)
+                contradiction_count = method.last_trace.get("contradiction_count", 0)
 
             record = {
                 "episode_id": ep.get("episode_id"),
@@ -180,6 +177,7 @@ def main():
                 "stored_count": stored_count,
                 "retrieved_count": len(retrieved_texts),
                 "superseded_count": superseded_count,
+                "contradiction_count":contradiction_count,
                 "question_type": ep.get("question_type"),
                 "topic": ep.get("topic", ""),
                 "k": args.k,
