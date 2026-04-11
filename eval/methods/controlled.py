@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from hashlib import sha1
 from pathlib import Path
@@ -9,7 +10,6 @@ from baselines.embeddings import (
     cosine_similarity,
     embed_one,
     embed_with_cache,
-    top_k_indices,
 )
 from memory.chroma_store import ChromaMemoryStore
 from memory.controlled_store_builder import build_controlled_store_from_episode
@@ -18,11 +18,33 @@ from memory.schema import MemoryRecord, MemoryStatus
 from utils.llm import call_llm, normalize_label
 
 
-class ControlledMethod:
-    """
-    Controlled-memory method with persistent storage and active-only retrieval.
-    """
+GENERIC_MEMORY_PATTERNS = {
+    "likes music",
+    "interested in music",
+    "appreciates literature",
+    "interested in literature",
+    "likes books",
+    "likes reading",
+}
 
+GENERIC_TOKENS = {
+    "music",
+    "books",
+    "book",
+    "reading",
+    "literature",
+    "art",
+    "stories",
+    "storytelling",
+}
+
+EVOLUTION_QUESTION_TYPES = {
+    "track_full_preference_evolution",
+    "recalling_the_reasons_behind_previous_updates",
+}
+
+
+class ControlledMethod:
     def __init__(
         self,
         run_root: str,
@@ -39,10 +61,6 @@ class ControlledMethod:
         self.last_trace: dict[str, Any] | None = None
 
     def answer(self, ep: dict):
-        """
-        Return the runner-compatible tuple:
-        prediction, raw model output, retrieved texts, retrieved scores
-        """
         trace = self.answer_with_trace(ep)
         self.last_trace = trace
 
@@ -51,7 +69,10 @@ class ControlledMethod:
         retrieved_texts = trace["retrieved_memories"]
         retrieved_scores = trace["retrieved_scores"]
 
-        return pred, raw_text, retrieved_texts, retrieved_scores
+        stored_count = trace.get("stored_memories_count", 0)
+        superseded_count = trace.get("superseded_count", 0)
+
+        return pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count
 
     def answer_with_trace(self, episode: dict[str, Any]) -> dict[str, Any]:
         episode_id = episode["episode_id"]
@@ -59,7 +80,6 @@ class ControlledMethod:
 
         episode_run_dir = self.run_root / f"episode_{episode_id}"
 
-        # Rebuild per-episode state to avoid stale persisted records across reruns.
         if self.reset_episode_run_dir and episode_run_dir.exists():
             shutil.rmtree(episode_run_dir)
 
@@ -80,9 +100,20 @@ class ControlledMethod:
             memory_type=self.memory_type,
         )
 
-        retrieved_records, retrieved_scores = self._retrieve_top_k(
+        question_type = episode.get("question_type", "")
+        if question_type in EVOLUTION_QUESTION_TYPES:
+            superseded_memories = store.list_memories(
+                persona_id=persona_id,
+                status=MemoryStatus.SUPERSEDED.value,
+                memory_type=self.memory_type,
+            )
+        else:
+            superseded_memories = []
+
+        retrieved_records, retrieved_scores, retrieval_debug = self._retrieve_top_k(
             episode=episode,
-            memories=active_memories,
+            active_memories=active_memories,
+            superseded_memories=superseded_memories,
             k=self.top_k,
         )
 
@@ -106,8 +137,9 @@ class ControlledMethod:
             "retrieved_count": len(retrieved_texts),
             "superseded_count": build_stats["superseded_count"],
             "superseded_ids": build_stats["superseded_ids"],
+            "contradiction_count": build_stats["contradiction_count"],
             "top_k": self.top_k,
-            "question_type": episode.get("question_type"),
+            "question_type": question_type,
             "topic": episode.get("topic", ""),
         }
 
@@ -124,6 +156,7 @@ class ControlledMethod:
                 "retrieved_memory_ids": [m.memory_id for m in retrieved_records],
                 "retrieved_texts": retrieved_texts,
                 "retrieved_scores": retrieved_scores,
+                "retrieval_debug": retrieval_debug,
                 "retrieved_count": len(retrieved_texts),
             },
         )
@@ -132,34 +165,210 @@ class ControlledMethod:
         self.last_trace = trace
         return trace
 
+    def _infer_query_slot(self, question: str, options: str) -> str | None:
+        combined = f"{question} {options}".lower()
+
+        if any(token in combined for token in ["music", "song", "playlist", "genre", "beats", "jazz", "rock", "pop"]):
+            return "music"
+        if any(token in combined for token in ["coffee", "tea", "juice", "drink", "soda"]):
+            return "drink"
+        if any(token in combined for token in ["pizza", "pasta", "spicy", "food", "breakfast", "dinner", "cuisine"]):
+            return "food"
+        if any(token in combined for token in ["text", "phone", "call", "email"]):
+            return "communication"
+        if any(token in combined for token in ["morning", "night", "weekend", "weekday"]):
+            return "schedule"
+        if "color" in combined:
+            return "color"
+
+        return None
+
+    def _memory_tokens(self, text: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+    def _specificity_bonus(self, memory: MemoryRecord) -> float:
+        text = memory.normalized_mem_text.lower()
+        tokens = self._memory_tokens(text)
+
+        bonus = 0.0
+        bonus += min(len(tokens), 8) * 0.015
+
+        if any(word in text for word in ["producing", "creates", "started", "hosts", "joined", "volunteers", "visits", "uses"]):
+            bonus += 0.08
+
+        target_kind = memory.metadata.get("target_kind")
+        if target_kind == "routine":
+            bonus += 0.05
+        if target_kind == "profile":
+            bonus += 0.04
+
+        if any(word in text for word in ["electronic", "pacific", "classic", "indie", "original", "instruments"]):
+            bonus += 0.05
+
+        return bonus
+
+    def _generic_penalty(self, memory: MemoryRecord) -> float:
+        text = memory.normalized_mem_text.lower()
+        tokens = self._memory_tokens(text)
+
+        penalty = 0.0
+
+        if text in GENERIC_MEMORY_PATTERNS:
+            penalty += 0.18
+
+        generic_count = sum(1 for tok in tokens if tok in GENERIC_TOKENS)
+        if generic_count >= 1 and len(tokens) <= 3:
+            penalty += 0.10
+
+        if text.startswith(("likes ", "interested in ", "appreciates ")) and len(tokens) <= 4:
+            penalty += 0.06
+
+        return penalty
+
+    def _rerank_score(self, semantic_score: float, memory: MemoryRecord) -> float:
+        specificity = float(memory.metadata.get("specificity_score", 0.0))
+        return semantic_score + self._specificity_bonus(memory) - self._generic_penalty(memory) + 0.15 * specificity
+
+    def _scored_candidates(
+        self,
+        memories: list[MemoryRecord],
+        query: str,
+        cache_key_prefix: str,
+    ) -> list[dict[str, Any]]:
+        if not memories:
+            return []
+
+        texts = [m.normalized_mem_text for m in memories]
+        fingerprint = sha1("||".join(texts).encode("utf-8")).hexdigest()[:16]
+        cache_key = f"{cache_key_prefix}_{fingerprint}"
+
+        matrix = embed_with_cache(texts, cache_key=cache_key)
+        query_vec = embed_one(query)
+        semantic_scores = cosine_similarity(query_vec, matrix)
+
+        rows: list[dict[str, Any]] = []
+        for i, memory in enumerate(memories):
+            semantic = float(semantic_scores[i])
+            final = self._rerank_score(semantic, memory)
+            rows.append(
+                {
+                    "memory": memory,
+                    "score": final,
+                    "semantic_score": semantic,
+                    "status": str(memory.status),
+                    "polarity": memory.metadata.get("polarity"),
+                    "target_kind": memory.metadata.get("target_kind"),
+                }
+            )
+        return rows
+
     def _retrieve_top_k(
         self,
         episode: dict[str, Any],
-        memories: list[MemoryRecord],
+        active_memories: list[MemoryRecord],
+        superseded_memories: list[MemoryRecord],
         k: int,
-    ) -> tuple[list[MemoryRecord], list[float]]:
-        if not memories:
-            return [], []
+    ) -> tuple[list[MemoryRecord], list[float], list[dict[str, Any]]]:
+        if not active_memories and not superseded_memories:
+            return [], [], []
 
-        texts = [m.normalized_mem_text for m in memories]
+        query_slot = self._infer_query_slot(
+            question=episode.get("question", ""),
+            options=episode.get("options", ""),
+        )
 
-        # Include a content fingerprint so embedding cache entries track the
-        # active memory set instead of only the episode identifier.
-        fingerprint = sha1("||".join(texts).encode("utf-8")).hexdigest()[:16]
-        cache_key = f"controlled_ep_{episode.get('question_id', episode.get('episode_id'))}_{fingerprint}"
+        filtered_active = active_memories
+        filtered_superseded = superseded_memories
 
-        matrix = embed_with_cache(texts, cache_key=cache_key)
+        if query_slot is not None:
+            slot_active = [m for m in active_memories if m.metadata.get("slot") == query_slot]
+            if slot_active:
+                filtered_active = slot_active
+
+            slot_superseded = [m for m in superseded_memories if m.metadata.get("slot") == query_slot]
+            if slot_superseded:
+                filtered_superseded = slot_superseded
 
         query = f"{episode.get('question', '')} {episode.get('options', '')}"
-        query_vec = embed_one(query)
+        question_type = episode.get("question_type", "")
+        effective_k = self.top_k
+        if question_type in EVOLUTION_QUESTION_TYPES:
+            effective_k = max(self.top_k, 7)
 
-        scores = cosine_similarity(query_vec, matrix)
-        top_idx = top_k_indices(scores, k=min(k, len(memories)))
+        active_rows = self._scored_candidates(
+            filtered_active,
+            query=query,
+            cache_key_prefix=f"controlled_active_{episode.get('question_id', episode.get('episode_id'))}",
+        )
 
-        retrieved_records = [memories[i] for i in top_idx]
-        retrieved_scores = [float(scores[i]) for i in top_idx]
+        superseded_rows = self._scored_candidates(
+            filtered_superseded,
+            query=query,
+            cache_key_prefix=f"controlled_superseded_{episode.get('question_id', episode.get('episode_id'))}",
+        )
 
-        return retrieved_records, retrieved_scores
+        if question_type in EVOLUTION_QUESTION_TYPES:
+            pos_active = [r for r in active_rows if r["polarity"] == "positive"]
+            neg_active = [r for r in active_rows if r["polarity"] == "negative"]
+            neutral_active = [r for r in active_rows if r["polarity"] not in {"positive", "negative"}]
+
+            pos_active.sort(key=lambda r: r["score"], reverse=True)
+            neg_active.sort(key=lambda r: r["score"], reverse=True)
+            neutral_active.sort(key=lambda r: r["score"], reverse=True)
+            superseded_rows.sort(key=lambda r: r["score"], reverse=True)
+
+            chosen_rows: list[dict[str, Any]] = []
+
+            # Force some trajectory shape.
+            if pos_active:
+                chosen_rows.append(pos_active[0])
+            if neg_active:
+                chosen_rows.append(neg_active[0])
+            if superseded_rows:
+                chosen_rows.append(superseded_rows[0])
+
+            seen_ids = {r["memory"].memory_id for r in chosen_rows}
+
+            remaining = sorted(
+                active_rows + superseded_rows,
+                key=lambda r: r["score"],
+                reverse=True,
+            )
+            for row in remaining:
+                if row["memory"].memory_id in seen_ids:
+                    continue
+                chosen_rows.append(row)
+                seen_ids.add(row["memory"].memory_id)
+                if len(chosen_rows) >= min(effective_k, len(active_rows) + len(superseded_rows)):
+                    break
+        else:
+            all_rows = sorted(active_rows, key=lambda r: r["score"], reverse=True)
+            chosen_rows = all_rows[: min(effective_k, len(all_rows))]
+
+        retrieved_records = [row["memory"] for row in chosen_rows]
+        retrieved_scores = [float(row["score"]) for row in chosen_rows]
+
+        retrieval_debug = []
+        all_debug_rows = active_rows + superseded_rows
+        all_debug_rows.sort(key=lambda r: r["score"], reverse=True)
+
+        for row in all_debug_rows:
+            memory = row["memory"]
+            retrieval_debug.append(
+                {
+                    "memory_id": memory.memory_id,
+                    "text": memory.normalized_mem_text,
+                    "score": float(row["score"]),
+                    "semantic_score": float(row["semantic_score"]),
+                    "slot": memory.metadata.get("slot"),
+                    "polarity": memory.metadata.get("polarity"),
+                    "target_kind": memory.metadata.get("target_kind"),
+                    "status": str(memory.status),
+                    "write_score": memory.metadata.get("write_score"),
+                }
+            )
+
+        return retrieved_records, retrieved_scores, retrieval_debug
 
     def _build_prompt(self, episode: dict[str, Any], retrieved_texts: list[str]) -> str:
         memories_block = "\n".join(f"- {text}" for text in retrieved_texts) if retrieved_texts else "None"
@@ -168,9 +377,9 @@ class ControlledMethod:
         options = episode.get("options", "") or ""
 
         return (
-            f"Below are the user's currently active memories:\n\n"
+            f"Below are the user's currently relevant memories:\n\n"
             f"{memories_block}\n\n"
-            f"Based on these active memories, answer the following question about the user:\n"
+            f"Based on these memories, answer the following question about the user:\n"
             f"Question: {question}\n"
             f"Options:\n{options}\n\n"
             f"Output format must be EXACTLY one of: (a) (b) (c) (d). No other text."

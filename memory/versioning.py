@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -7,14 +8,21 @@ from memory.schema import MemoryRecord, MemoryStatus
 from memory.store_interface import MemoryStore
 
 
+STOPWORDS = {
+    "a", "an", "the", "my", "your", "i", "it", "is", "in", "of", "and", "or",
+    "to", "for", "with", "on", "at", "this", "that", "these", "those",
+    "over", "than",
+}
+
+
 @dataclass
 class VersioningResult:
     stored_record: MemoryRecord
     superseded_ids: list[str]
     conflict_bucket: Optional[str] = None
-
-
-_NEGATION_TOKENS = {"don't", "dont", "do not", "dislike", "hate", "avoid", "no"}
+    contradiction_count: int = 0
+    wrote_new: bool = True
+    duplicate_of: Optional[str] = None
 
 
 def _status_value(value: object) -> str:
@@ -23,89 +31,165 @@ def _status_value(value: object) -> str:
     return str(value)
 
 
-def _is_negative(text: str) -> bool:
-    lowered = text.lower()
-    return any(token in lowered for token in _NEGATION_TOKENS)
-
-
-def _bucket_from_text(text: str) -> str:
-    """
-    Very simple v0 bucket for conflict grouping.
-    We only need something stable enough for local controlled-memory behavior.
-    """
-    lowered = text.lower()
-
-    if "favorite color" in lowered or "color" in lowered:
-        return "color_preference"
-    if "coffee" in lowered or "tea" in lowered or "drink" in lowered:
-        return "drink_preference"
-    if "food" in lowered or "pizza" in lowered or "pasta" in lowered or "spicy" in lowered:
-        return "food_preference"
-    if "phone" in lowered or "call" in lowered or "text" in lowered or "email" in lowered:
-        return "communication_preference"
-    if "morning" in lowered or "night" in lowered or "weekend" in lowered:
-        return "schedule_preference"
-
+def conflict_bucket(record: MemoryRecord) -> str:
+    slot = record.metadata.get("slot")
+    kind = record.metadata.get("target_kind")
+    if slot and kind:
+        return f"{slot}::{kind}"
+    if slot:
+        return f"{slot}::{record.memory_type}"
+    if record.memory_type:
+        return record.memory_type
     return "general_preference"
 
 
-def conflict_bucket(record: MemoryRecord) -> str:
-    if record.memory_type and record.memory_type != "general_preference":
-        return record.memory_type
-    return _bucket_from_text(record.normalized_mem_text)
+def _same_persona(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.persona_id == new.persona_id
+
+
+def _same_slot(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("slot", "general") == new.metadata.get("slot", "general")
+
+
+def _same_target_kind(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("target_kind", "topic") == new.metadata.get("target_kind", "topic")
+
+
+def _normalize_target_text(text: str) -> str:
+    lowered = text.strip().lower()
+    prefixes = [
+        "likes ",
+        "dislikes ",
+        "prefers ",
+        "usually ",
+        "is ",
+        "interested in ",
+    ]
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :].strip()
+    return lowered
+
+
+def _token_set(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if token not in STOPWORDS}
+
+
+def _target_overlap(existing: MemoryRecord, new: MemoryRecord) -> float:
+    a = _token_set(_normalize_target_text(existing.normalized_mem_text))
+    b = _token_set(_normalize_target_text(new.normalized_mem_text))
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _is_exact_duplicate(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.normalized_mem_text.strip().lower() == new.normalized_mem_text.strip().lower()
+
+
+def _is_semantic_duplicate(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    if not _same_slot(existing, new):
+        return False
+    if not _same_target_kind(existing, new):
+        return False
+    if existing.metadata.get("polarity") != new.metadata.get("polarity"):
+        return False
+    return _target_overlap(existing, new) >= 0.90
+
+
+def _is_opposition(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    existing_polarity = existing.metadata.get("polarity")
+    new_polarity = new.metadata.get("polarity")
+    return (
+        existing_polarity == "positive" and new_polarity == "negative"
+    ) or (
+        existing_polarity == "negative" and new_polarity == "positive"
+    )
+
+
+def _single_value_slot(record: MemoryRecord) -> bool:
+    slot = record.metadata.get("slot", "general")
+    kind = record.metadata.get("target_kind", "topic")
+
+    if kind in {"social_style", "profile"}:
+        return True
+
+    if slot in {"communication", "schedule", "location", "profile"}:
+        return True
+
+    return False
 
 
 def memories_conflict(existing: MemoryRecord, new: MemoryRecord) -> bool:
-    """
-    v0 conflict rule:
-    - same persona
-    - both active
-    - same conflict bucket
-    - not identical text
-    """
-    if existing.persona_id != new.persona_id:
+    if not _same_persona(existing, new):
         return False
-
     if _status_value(existing.status) != MemoryStatus.ACTIVE.value:
         return False
-
-    existing_bucket = conflict_bucket(existing)
-    new_bucket = conflict_bucket(new)
-
-    if existing_bucket != new_bucket:
+    if not _same_slot(existing, new):
+        return False
+    if _is_exact_duplicate(existing, new):
         return False
 
-    if existing.normalized_mem_text.strip().lower() == new.normalized_mem_text.strip().lower():
-        return False
+    overlap = _target_overlap(existing, new)
 
-    # For v0, treat same bucket with changed content as a superseding update.
-    return True
+    if _single_value_slot(new) and _same_target_kind(existing, new):
+        return True
 
+    if new.metadata.get("update_hint", False) and _same_target_kind(existing, new) and overlap >= 0.45:
+        return True
+
+    if _is_opposition(existing, new) and overlap >= 0.55:
+        return True
+
+    return False
+
+def _is_strictly_broader(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    existing_tokens = _token_set(_normalize_target_text(existing.normalized_mem_text))
+    new_tokens = _token_set(_normalize_target_text(new.normalized_mem_text))
+
+    return (
+        new_tokens
+        and new_tokens.issubset(existing_tokens)
+        and len(new_tokens) < len(existing_tokens)
+        and existing.metadata.get("slot") == new.metadata.get("slot")
+        and existing.metadata.get("target_kind") == new.metadata.get("target_kind")
+        and existing.metadata.get("polarity") == new.metadata.get("polarity")
+    )
 
 def add_memory(record: MemoryRecord, store: MemoryStore) -> VersioningResult:
-    """
-    Add a new memory and supersede old conflicting active memories.
-
-    Behavior:
-    - find active records for same persona and type
-    - supersede conflicts
-    - new record links to the most recent conflicting memory, if any
-    - then store the new record
-    """
     active_candidates = store.list_memories(
         persona_id=record.persona_id,
         status=MemoryStatus.ACTIVE.value,
-        memory_type=record.memory_type,
     )
 
-    conflicts = [m for m in active_candidates if memories_conflict(m, record)]
+    for existing in active_candidates:
+        if _is_exact_duplicate(existing, record) or _is_semantic_duplicate(existing, record):
+            return VersioningResult(
+                stored_record=existing,
+                superseded_ids=[],
+                conflict_bucket=conflict_bucket(existing),
+                contradiction_count=0,
+                wrote_new=False,
+                duplicate_of=existing.memory_id,
+            )
+
+        if _is_strictly_broader(existing, record):
+            return VersioningResult(
+                stored_record=existing,
+                superseded_ids=[],
+                conflict_bucket=conflict_bucket(existing),
+                contradiction_count=0,
+                wrote_new=False,
+                duplicate_of=existing.memory_id,
+            )
+
+    conflicts = [memory for memory in active_candidates if memories_conflict(memory, record)]
 
     superseded_ids: list[str] = []
     replacement_link: Optional[str] = record.supersession_link
 
     if conflicts:
-        # Use most recent conflicting record as the forward link target.
-        most_recent_conflict = max(conflicts, key=lambda m: m.turn_index)
+        most_recent_conflict = max(conflicts, key=lambda memory: memory.turn_index)
         replacement_link = most_recent_conflict.memory_id
 
         for old in conflicts:
@@ -120,8 +204,18 @@ def add_memory(record: MemoryRecord, store: MemoryStore) -> VersioningResult:
     )
     stored = store.put_memory(final_record)
 
+    contradiction_count = sum(
+        1
+        for old in conflicts
+        if _is_opposition(old, final_record) and _target_overlap(old, final_record) >= 0.55
+    )
+
     return VersioningResult(
         stored_record=stored,
         superseded_ids=superseded_ids,
         conflict_bucket=conflict_bucket(final_record),
+        contradiction_count=contradiction_count,
+        wrote_new=True,
+        duplicate_of=None,
     )
+

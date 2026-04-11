@@ -1,10 +1,97 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import time
+from functools import lru_cache
 from typing import Any
 
+import numpy as np
+from groq import Groq
+
+from baselines.embeddings import embed_one
 from memory.schema import MemoryRecord, MemoryStatus
+
+
+WRITE_GATE_PROMPT = """
+Extract durable user-specific memories from one user utterance.
+
+Keep only stable facts, preferences, habits, or profile info useful later.
+Reject temporary moods, one-off events, vague filler, and long explanations.
+
+Return ONLY JSON:
+{"items":[
+  {"canonical_memory":"short normalized phrase",
+   "slot":"food|drink|music|books|communication|schedule|location|profile|general",
+   "target_kind":"topic|routine|social_style|profile",
+   "polarity":"positive|negative|neutral|interest",
+   "update_hint":false}
+]}
+
+Return at most 1 item unless the utterance clearly contains 2 distinct durable memories.
+
+Set update_hint=true when:
+- the user signals a change from a prior state
+- the text includes phrases like "used to", "no longer", "not anymore", "lost interest"
+- the user describes something that previously applied but now does not
+- the user contrasts an old preference with a new one
+
+Extract ALL distinct durable preference or profile signals from the utterance.
+A single utterance may contain multiple memories.
+Do not merge different preferences into one item.
+Commonly missed: a negative update and a positive anchor in the same utterance.
+
+Examples:
+"likes producing music"
+"dislikes mushrooms"
+"prefers texting over calling"
+"usually works late"
+"is vegetarian"
+"is from Seattle"
+
+If nothing qualifies, return {"items":[]}.
+"""
+
+
+VALID_SLOTS = {
+    "food",
+    "drink",
+    "music",
+    "books",
+    "communication",
+    "schedule",
+    "location",
+    "profile",
+    "general",
+}
+
+VALID_TARGET_KINDS = {
+    "topic",
+    "routine",
+    "social_style",
+    "profile",
+}
+
+VALID_MEMORY_TYPES = {
+    "food_preference",
+    "drink_preference",
+    "music_preference",
+    "book_preference",
+    "communication_preference",
+    "schedule_preference",
+    "profile_fact",
+    "habit_or_routine",
+    "general_preference",
+}
+
+VALID_POLARITIES = {
+    "positive",
+    "negative",
+    "neutral",
+    "interest",
+}
 
 
 def _make_memory_id(persona_id: str, turn_index: int, normalized_text: str) -> str:
@@ -13,168 +100,359 @@ def _make_memory_id(persona_id: str, turn_index: int, normalized_text: str) -> s
     return f"mem_{digest}"
 
 
-def _classify_memory_type(text: str) -> str:
-    lowered = text.lower()
-
-    if any(token in lowered for token in ["coffee", "tea", "juice", "drink", "soda", "music", "song", "playlist", "genre", "beats"]):
-        return "music_preference" if any(token in lowered for token in ["music", "song", "playlist", "genre", "beats"]) else "drink_preference"
-
-    if any(token in lowered for token in ["pizza", "pasta", "spicy", "food", "breakfast", "dinner", "cuisine"]):
-        return "food_preference"
-
-    if any(token in lowered for token in ["text", "phone", "call", "email"]):
-        return "communication_preference"
-
-    if any(token in lowered for token in ["morning", "night", "weekend", "weekday"]):
-        return "schedule_preference"
-
-    if "color" in lowered:
-        return "color_preference"
-
-    return "general_preference"
+def _clean_text(text: str) -> str:
+    text = str(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def _clean_tail(value: str) -> str:
-    value = value.strip()
-    value = re.sub(r"[.?!]+$", "", value).strip()
-    value = re.sub(r"\s+", " ", value)
-    return value
-
-
-def _normalize_text(raw_text: str) -> str | None:
-    text = raw_text.strip()
-
-    favorite_match = re.search(
-        r"\bmy\s+favorite\s+(?P<slot>\w+)\s+is\s+(?P<value>.+)",
+def _truncate_clause(text: str) -> str:
+    text = _clean_text(text)
+    text = re.split(
+        r"\b(?:because|since|especially|when|which|that|while|although|though)\b",
         text,
-        re.IGNORECASE,
-    )
-    if favorite_match:
-        slot = favorite_match.group("slot").strip().lower()
-        value = _clean_tail(favorite_match.group("value"))
-        return f"favorite {slot} is {value}"
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(r"[.;:!?]", text, maxsplit=1)[0]
+    return _clean_text(text)
 
-    negative_match = re.search(
-        r"\bI\s+(?:do\s+not|don't|dont)\s+like\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if negative_match:
-        value = _clean_tail(negative_match.group("value"))
-        return f"dislikes {value}"
 
-    prefer_match = re.search(
-        r"\bI\s+prefer\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if prefer_match:
-        value = _clean_tail(prefer_match.group("value"))
-        return f"prefers {value}"
+def _canonicalize_prefix(text: str) -> str:
+    text = text.strip().lower()
 
-    like_match = re.search(
-        r"\bI\s+like\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if like_match:
-        value = _clean_tail(like_match.group("value"))
-        return f"likes {value}"
+    replacements = [
+        ("enjoys ", "likes "),
+        ("enjoy ", "likes "),
+        ("loves ", "likes "),
+        ("love ", "likes "),
+        ("hates ", "dislikes "),
+        ("hate ", "dislikes "),
+        ("never drinks ", "dislikes "),
+        ("never eats ", "dislikes "),
+        ("lives in ", "is from "),
+        ("from ", "is from "),
+        ("works best ", "prefers "),
+        ("works better ", "prefers "),
+    ]
 
-    love_match = re.search(
-        r"\bI\s+love\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if love_match:
-        value = _clean_tail(love_match.group("value"))
-        return f"likes {value}"
+    for old, new in replacements:
+        if text.startswith(old):
+            return new + text[len(old):]
 
-    enjoy_match = re.search(
-        r"\bI\s+enjoy\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if enjoy_match:
-        value = _clean_tail(enjoy_match.group("value"))
-        return f"enjoys {value}"
+    return text
 
-    interested_match = re.search(
-        r"\bI\s+(?:am\s+|\'m\s+)?interested\s+in\s+(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if interested_match:
-        value = _clean_tail(interested_match.group("value"))
-        return f"interested in {value}"
 
-    from_now_on_match = re.search(
-        r"\bfrom\s+now\s+on\b[,:\s]*(?P<value>.+)",
-        text,
-        re.IGNORECASE,
-    )
-    if from_now_on_match:
-        value = _clean_tail(from_now_on_match.group("value"))
-        return value.lower()
+def _normalize_canonical_memory(text: str) -> str:
+    text = _truncate_clause(text).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" .,!?:;\"'")
+    text = _canonicalize_prefix(text)
+    return text
 
-    return None
+
+def _is_valid_canonical_memory(text: str) -> bool:
+    if not text or len(text) < 5:
+        return False
+
+    toks = text.split()
+    if len(toks) > 12:
+        return False
+
+    banned = {"because", "since", "which", "that", "while", "although", "though", "when"}
+    if any(tok in banned for tok in toks):
+        return False
+
+    return True
 
 
 def should_store_turn(turn: dict[str, Any]) -> bool:
     if turn.get("role") != "user":
         return False
 
-    content = str(turn.get("content", ""))
-    lowered = content.lower()
+    content = str(turn.get("content", "")).strip().lower()
+    if len(content) <= 20:
+        return False
 
-    trigger_terms = [
+    padded = f" {content} "
+
+    first_person_markers = [
+        " i ",
+        " i'm ",
+        " i’m ",
+        " i am ",
+        " i was ",
+        " i've ",
+        " i’ve ",
+        " i'd ",
+        " i’d ",
+        " my ",
+        " me ",
+        " mine ",
+    ]
+    if not any(marker in padded for marker in first_person_markers):
+        return False
+
+    durable_markers = [
         "prefer",
         "like",
-        "don't",
-        "dont",
-        "from now on",
-        "favorite",
+        "love",
         "enjoy",
+        "hate",
+        "dislike",
+        "favorite",
+        "usually",
+        "always",
+        "never",
+        "used to",
+        "from now on",
+        "no longer",
         "interested in",
-        "interested",
+        "passionate about",
+        "curious about",
+        "rather than",
+        "better when",
+        "work better",
+        "works better",
+        "i'm from",
+        "i am from",
+        "i live in",
+        "vegetarian",
+        "vegan",
     ]
-    return any(term in lowered for term in trigger_terms)
+    if not any(marker in content for marker in durable_markers):
+        return False
+
+    transient_markers = [
+        "today",
+        "tonight",
+        "yesterday",
+        "last night",
+        "this week",
+        "for now",
+    ]
+    if any(marker in content for marker in transient_markers):
+        return False
+
+    return True
 
 
-def extract_memories_from_turn(
-    turn: dict[str, Any],
+def _default_memory_type(slot: str, target_kind: str) -> str:
+    slot_map = {
+        "music": "music_preference",
+        "books": "book_preference",
+        "drink": "drink_preference",
+        "food": "food_preference",
+        "communication": "communication_preference",
+        "schedule": "schedule_preference",
+        "profile": "profile_fact",
+    }
+    if slot in slot_map:
+        return slot_map[slot]
+    if target_kind == "routine":
+        return "habit_or_routine"
+    return "general_preference"
+
+
+@lru_cache(maxsize=32)
+def _slot_anchor_vec(slot: str) -> tuple[float, ...]:
+    vec = embed_one(f"{slot} in general")
+    return tuple(float(x) for x in vec)
+
+
+def compute_specificity_score(canonical_text: str, slot: str) -> float:
+    mem_vec = np.array(embed_one(canonical_text), dtype=float)
+    anchor_vec = np.array(_slot_anchor_vec(slot), dtype=float)
+
+    mem_norm = np.linalg.norm(mem_vec)
+    anchor_norm = np.linalg.norm(anchor_vec)
+    if mem_norm == 0.0 or anchor_norm == 0.0:
+        return 0.0
+
+    sim = float(np.dot(mem_vec, anchor_vec) / (mem_norm * anchor_norm))
+    sim = max(-1.0, min(1.0, sim))
+    return 1.0 - sim
+
+
+class GroqWriteGate:
+    def __init__(
+        self,
+        model_name: str | None = None,
+        max_completion_tokens: int = 96,
+        api_key: str | None = None,
+    ):
+        self.model_name = model_name or os.environ.get(
+            "WRITE_GATE_MODEL",
+            "llama-3.3-70b-versatile",
+        )
+        print(f"[write_gate] loading model: {self.model_name}", flush=True)
+
+        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
+        if not resolved_key:
+            raise ValueError("GROQ_API_KEY is not set.")
+
+        self.client = Groq(api_key=resolved_key)
+        self.max_completion_tokens = max_completion_tokens
+        self.cache: dict[str, list[dict[str, Any]]] = {}
+
+    def _extract_json_text(self, text: str) -> str:
+        text = text.strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"Model output did not contain JSON object: {text}")
+        return text[start : end + 1]
+
+    def extract_candidates(self, utterance: str) -> list[dict[str, Any]]:
+        cache_key = utterance.strip()
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        completion = self.client.chat.completions.create(
+            model=self.model_name,
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_completion_tokens=self.max_completion_tokens,
+            messages=[
+                {"role": "system", "content": WRITE_GATE_PROMPT},
+                {"role": "user", "content": utterance},
+            ],
+        )
+
+        raw = completion.choices[0].message.content.strip()
+        print(f"[write_gate][raw] {raw}", flush=True)
+
+        try:
+            raw_json = self._extract_json_text(raw)
+            parsed = json.loads(raw_json)
+        except Exception:
+            self.cache[cache_key] = []
+            return []
+
+        items = parsed.get("items", [])
+        if not isinstance(items, list):
+            self.cache[cache_key] = []
+            return []
+
+        cleaned: list[dict[str, Any]] = []
+
+        for item in items:
+            canonical_memory = _normalize_canonical_memory(str(item.get("canonical_memory", "")))
+            if not _is_valid_canonical_memory(canonical_memory):
+                print(
+                    f"[write_gate][drop] invalid_canonical raw={item.get('canonical_memory', '')!r} normalized={canonical_memory!r}",
+                    flush=True,
+                )
+                continue
+
+            slot = str(item.get("slot", "general")).strip().lower()
+            if slot not in VALID_SLOTS:
+                slot = "general"
+
+            target_kind = str(item.get("target_kind", "topic")).strip().lower()
+            if target_kind not in VALID_TARGET_KINDS:
+                target_kind = "topic"
+
+            polarity = str(item.get("polarity", "neutral")).strip().lower()
+            if polarity not in VALID_POLARITIES:
+                polarity = "neutral"
+
+            memory_type = _default_memory_type(slot, target_kind)
+
+            cleaned.append(
+                {
+                    "normalized_text": canonical_memory,
+                    "slot": slot,
+                    "target_kind": target_kind,
+                    "polarity": polarity,
+                    "memory_type": memory_type,
+                    "extraction_reason": "groq_write_gate",
+                    "update_hint": bool(item.get("update_hint", False)),
+                    "confidence": 1.0,
+                }
+            )
+
+        self.cache[cache_key] = cleaned
+        return cleaned
+
+
+_GATE: GroqWriteGate | None = None
+
+
+def _get_gate() -> GroqWriteGate:
+    global _GATE
+    if _GATE is None:
+        _GATE = GroqWriteGate()
+    return _GATE
+
+
+def _build_memory_record(
     persona_id: str,
-) -> list[MemoryRecord]:
-    if not should_store_turn(turn):
-        return []
-
-    content = str(turn.get("content", "")).strip()
-    turn_index = int(turn.get("turn_index", 0))
-
-    normalized = _normalize_text(content)
-    if not normalized:
-        return []
-    if not _is_memory_worthy(normalized):
-        return []
-
-    memory_type = _classify_memory_type(normalized)
+    turn_index: int,
+    source_text: str,
+    candidate: dict[str, Any],
+) -> MemoryRecord:
+    normalized = candidate["normalized_text"]
     memory_id = _make_memory_id(persona_id, turn_index, normalized)
 
-    record = MemoryRecord(
+    return MemoryRecord(
         memory_id=memory_id,
         persona_id=persona_id,
         turn_index=turn_index,
         status=MemoryStatus.ACTIVE,
         normalized_mem_text=normalized,
-        memory_type=memory_type,
+        memory_type=candidate["memory_type"],
         metadata={
-            "source_utterance": content,
-            "router_version": "write_router_v0_1",
+            "source_utterance": source_text,
+            "router_version": "write_gate_v5_groq_specificity",
             "source_turn_index": turn_index,
-            "extraction_note": "rule_based_trigger_match",
+            "slot": candidate["slot"],
+            "polarity": candidate["polarity"],
+            "target_kind": candidate["target_kind"],
+            "confidence": candidate.get("confidence", 1.0),
+            "extraction_reason": candidate["extraction_reason"],
+            "update_hint": candidate["update_hint"],
+            "specificity_score": compute_specificity_score(
+                normalized,
+                candidate["slot"],
+            ),
         },
     )
-    return [record]
+
+
+def extract_memories_from_turn(turn: dict[str, Any], persona_id: str) -> list[MemoryRecord]:
+    if not should_store_turn(turn):
+        return []
+
+    content = _clean_text(turn.get("content", ""))
+    content = content[:450]
+    if not content:
+        return []
+
+    turn_index = int(turn.get("turn_index", 0))
+    gate = _get_gate()
+
+    start = time.perf_counter()
+    candidates = gate.extract_candidates(content)
+    elapsed = time.perf_counter() - start
+    print(f"[write_gate] persona={persona_id} turn={turn_index} took {elapsed:.2f}s", flush=True)
+
+    records: list[MemoryRecord] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for candidate in candidates:
+        key = (
+            candidate["normalized_text"],
+            candidate["slot"],
+            candidate["target_kind"],
+            candidate["polarity"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(_build_memory_record(persona_id, turn_index, content, candidate))
+
+    return records
 
 
 def extract_memories_from_episode(episode: dict[str, Any]) -> list[MemoryRecord]:
@@ -185,22 +463,3 @@ def extract_memories_from_episode(episode: dict[str, Any]) -> list[MemoryRecord]
     for turn in turns:
         memories.extend(extract_memories_from_turn(turn, persona_id))
     return memories
-
-def _is_memory_worthy(normalized_text: str) -> bool:
-    lowered = normalized_text.strip().lower()
-
-    reject_prefixes = [
-        "enjoys myself",
-        "enjoys it",
-        "enjoys this",
-        "enjoys that",
-        "enjoys being",
-        "enjoys meeting",
-        "enjoys talking",
-        "enjoys spending time",
-    ]
-
-    if any(lowered.startswith(prefix) for prefix in reject_prefixes):
-        return False
-
-    return True
