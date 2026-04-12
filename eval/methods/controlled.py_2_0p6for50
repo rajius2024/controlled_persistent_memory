@@ -119,7 +119,7 @@ class ControlledMethod:
 
         retrieved_texts = [m.normalized_mem_text for m in retrieved_records]
 
-        prompt = self._build_prompt(episode, retrieved_records)
+        prompt = self._build_prompt(episode, retrieved_texts)
         raw_text = call_llm(prompt)
 
         trace = {
@@ -168,32 +168,18 @@ class ControlledMethod:
     def _infer_query_slot(self, question: str, options: str) -> str | None:
         combined = f"{question} {options}".lower()
 
-        if any(token in combined for token in [
-            "music", "song", "playlist", "genre", "beats", "jazz", "rock", "pop",
-            "album", "artist", "artists", "documentary", "podcast", "instrument",
-            "instruments", "rhythm", "melody"
-        ]):
+        if any(token in combined for token in ["music", "song", "playlist", "genre", "beats", "jazz", "rock", "pop"]):
             return "music"
-
-        if any(token in combined for token in [
-            "book", "books", "reading", "read", "reader", "novel", "novels",
-            "literature", "literary", "author", "authors", "bookstore",
-            "bookstores", "library", "libraries", "blog", "blogging",
-            "fiction", "nonfiction", "poetry"
-        ]):
-            return "books"
-
         if any(token in combined for token in ["coffee", "tea", "juice", "drink", "soda"]):
             return "drink"
-
         if any(token in combined for token in ["pizza", "pasta", "spicy", "food", "breakfast", "dinner", "cuisine"]):
             return "food"
-
         if any(token in combined for token in ["text", "phone", "call", "email"]):
             return "communication"
-
         if any(token in combined for token in ["morning", "night", "weekend", "weekday"]):
             return "schedule"
+        if "color" in combined:
+            return "color"
 
         return None
 
@@ -363,7 +349,7 @@ class ControlledMethod:
             all_rows = sorted(active_rows, key=lambda r: r["score"], reverse=True)
             chosen_rows = all_rows[: min(effective_k, len(all_rows))]
 
-        if len(chosen_rows) < 5:
+        if len(chosen_rows) < 3:
             fallback_rows = self._scored_candidates(
                 active_memories,
                 query=query,
@@ -411,33 +397,17 @@ class ControlledMethod:
 
         return retrieved_records, retrieved_scores, retrieval_debug
 
-    def _build_prompt(self, episode: dict[str, Any], retrieved_records: list[MemoryRecord]) -> str:
-        if retrieved_records:
-            memory_lines = []
-            for memory in retrieved_records:
-                canonical = memory.normalized_mem_text
-                provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                if provenance:
-                    memory_lines.append(
-                        f"- Memory: {canonical}\n"
-                        f"  Evidence: {provenance}"
-                    )
-                else:
-                    memory_lines.append(f"- Memory: {canonical}")
-            memories_block = "\n".join(memory_lines)
-        else:
-            memories_block = "None"
+    def _build_prompt(self, episode: dict[str, Any], retrieved_texts: list[str]) -> str:
+        memories_block = "\n".join(f"- {text}" for text in retrieved_texts) if retrieved_texts else "None"
 
         question = episode.get("question", "") or ""
         options = episode.get("options", "") or ""
 
         return (
-            f"Below are the user's relevant memories and supporting evidence:\n\n"
+            f"Below are the user's currently relevant memories:\n\n"
             f"{memories_block}\n\n"
-            f"Use both the memory statements and their evidence to answer the question.\n"
+            f"Based on these memories, answer the following question about the user:\n"
             f"Question: {question}\n"
             f"Options:\n{options}\n\n"
             f"Output format must be EXACTLY one of: (a) (b) (c) (d). No other text."
         )
-
-

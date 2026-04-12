@@ -416,7 +416,6 @@ def _build_memory_record(
         memory_type=candidate["memory_type"],
         metadata={
             "source_utterance": source_text,
-            "provenance_text": source_text[:300],
             "router_version": "write_gate_v5_groq_specificity",
             "source_turn_index": turn_index,
             "slot": candidate["slot"],
