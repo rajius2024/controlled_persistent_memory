@@ -1,0 +1,170 @@
+method      | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded | total_stored | total_retrieved | irrelevant_retrieval_rate | outdated_contradiction_errors | memory_precision
+------------+----------+---------+--------------+------------+---------------+----------------+--------------+-----------------+---------------------------+-------------------------------+-----------------
+no_memory   | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000          | 0            | 0               | TODO                      | TODO                          | TODO            
+controlled  | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400         | 4834         | 288             | TODO                      | TODO                          | TODO            
+vanilla_rag | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000          | 8471         | 250             | TODO                      | TODO                          | TODO            
+
+================================================================================
+SCENARIO BREAKDOWNS: no_memory
+================================================================================
+
+By topic
+group               | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------------------+----------+---------+--------------+------------+---------------+---------------
+bookRecommendation  | 33       | 18      | 0.545        | 0.000      | 0.000         | 0.000         
+musicRecommendation | 17       | 8       | 0.471        | 0.000      | 0.000         | 0.000         
+
+By question_type
+group                                         | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+----------------------------------------------+----------+---------+--------------+------------+---------------+---------------
+recalling_the_reasons_behind_previous_updates | 10       | 6       | 0.600        | 0.000      | 0.000         | 0.000         
+track_full_preference_evolution               | 9        | 6       | 0.667        | 0.000      | 0.000         | 0.000         
+generalizing_to_new_scenarios                 | 8        | 5       | 0.625        | 0.000      | 0.000         | 0.000         
+recall_user_shared_facts                      | 8        | 2       | 0.250        | 0.000      | 0.000         | 0.000         
+suggest_new_ideas                             | 8        | 4       | 0.500        | 0.000      | 0.000         | 0.000         
+provide_preference_aligned_recommendations    | 7        | 3       | 0.429        | 0.000      | 0.000         | 0.000         
+
+By persona_id
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By context_length_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By distance_to_ref_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By distance_to_ref_in_blocks bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By num_irrelevant_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By distance_to_ref_proportion_in_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+By end_index_in_shared_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 26      | 0.520        | 0.000      | 0.000         | 0.000         
+
+================================================================================
+SCENARIO BREAKDOWNS: controlled
+================================================================================
+
+By topic
+group               | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------------------+----------+---------+--------------+------------+---------------+---------------
+bookRecommendation  | 33       | 25      | 0.758        | 98.515     | 5.788         | 17.152        
+musicRecommendation | 17       | 9       | 0.529        | 93.118     | 5.706         | 23.765        
+
+By question_type
+group                                         | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+----------------------------------------------+----------+---------+--------------+------------+---------------+---------------
+recalling_the_reasons_behind_previous_updates | 10       | 7       | 0.700        | 96.700     | 7.000         | 19.300        
+track_full_preference_evolution               | 9        | 6       | 0.667        | 92.778     | 7.000         | 19.667        
+generalizing_to_new_scenarios                 | 8        | 5       | 0.625        | 99.500     | 5.000         | 17.000        
+recall_user_shared_facts                      | 8        | 5       | 0.625        | 97.625     | 5.000         | 19.375        
+suggest_new_ideas                             | 8        | 6       | 0.750        | 96.500     | 5.000         | 21.125        
+provide_preference_aligned_recommendations    | 7        | 5       | 0.714        | 97.571     | 5.000         | 20.000        
+
+By persona_id
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By context_length_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By distance_to_ref_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By distance_to_ref_in_blocks bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By num_irrelevant_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By distance_to_ref_proportion_in_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+By end_index_in_shared_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 34      | 0.680        | 96.680     | 5.760         | 19.400        
+
+================================================================================
+SCENARIO BREAKDOWNS: vanilla_rag
+================================================================================
+
+By topic
+group               | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------------------+----------+---------+--------------+------------+---------------+---------------
+bookRecommendation  | 33       | 22      | 0.667        | 165.303    | 5.000         | 0.000         
+musicRecommendation | 17       | 11      | 0.647        | 177.412    | 5.000         | 0.000         
+
+By question_type
+group                                         | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+----------------------------------------------+----------+---------+--------------+------------+---------------+---------------
+recalling_the_reasons_behind_previous_updates | 10       | 6       | 0.600        | 168.400    | 5.000         | 0.000         
+track_full_preference_evolution               | 9        | 5       | 0.556        | 158.556    | 5.000         | 0.000         
+generalizing_to_new_scenarios                 | 8        | 4       | 0.500        | 168.500    | 5.000         | 0.000         
+recall_user_shared_facts                      | 8        | 7       | 0.875        | 173.125    | 5.000         | 0.000         
+suggest_new_ideas                             | 8        | 6       | 0.750        | 176.250    | 5.000         | 0.000         
+provide_preference_aligned_recommendations    | 7        | 5       | 0.714        | 173.857    | 5.000         | 0.000         
+
+By persona_id
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By context_length_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By distance_to_ref_in_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By distance_to_ref_in_blocks bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By num_irrelevant_tokens bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By distance_to_ref_proportion_in_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
+
+By end_index_in_shared_context bucket
+group   | episodes | correct | task_success | avg_stored | avg_retrieved | avg_superseded
+--------+----------+---------+--------------+------------+---------------+---------------
+UNKNOWN | 50       | 33      | 0.660        | 169.420    | 5.000         | 0.000         
