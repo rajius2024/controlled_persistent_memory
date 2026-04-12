@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import math
 import shutil
+from collections import Counter
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -200,6 +202,101 @@ class ControlledMethod:
     def _memory_tokens(self, text: str) -> set[str]:
         return set(re.findall(r"[a-z0-9]+", text.lower()))
 
+    def _parse_options(self, options: str) -> list[str]:
+        matches = re.findall(
+            r"\([a-d]\)\s*(.*?)(?=\s*\([a-d]\)|$)",
+            options,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return [m.strip() for m in matches if m.strip()]
+
+
+    def _bm25_retrieve(
+        self,
+        memories: list[MemoryRecord],
+        query: str,
+        k: int = 20,
+    ) -> list[MemoryRecord]:
+        if not memories:
+            return []
+
+        query_terms = list(self._memory_tokens(query))
+        if not query_terms:
+            return []
+
+        docs: list[list[str]] = []
+        doc_freq: Counter[str] = Counter()
+
+        for memory in memories:
+            tokens = list(self._memory_tokens(memory.normalized_mem_text))
+            docs.append(tokens)
+            for term in set(tokens):
+                doc_freq[term] += 1
+
+        N = len(docs)
+        avgdl = sum(len(doc) for doc in docs) / max(N, 1)
+
+        k1 = 1.5
+        b = 0.75
+
+        scored: list[tuple[float, MemoryRecord]] = []
+
+        for memory, doc in zip(memories, docs):
+            doc_len = len(doc)
+            tf = Counter(doc)
+            score = 0.0
+
+            for term in query_terms:
+                if term not in tf:
+                    continue
+
+                df = doc_freq.get(term, 0)
+                idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                freq = tf[term]
+
+                denom = freq + k1 * (1 - b + b * doc_len / max(avgdl, 1e-9))
+                score += idf * (freq * (k1 + 1)) / max(denom, 1e-9)
+
+            if score > 0.0:
+                scored.append((score, memory))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [memory for _, memory in scored[:k]]
+
+
+    def _option_conditioned_candidates(
+        self,
+        memories: list[MemoryRecord],
+        question: str,
+        options: str,
+        per_option_k: int = 3,
+    ) -> list[MemoryRecord]:
+        option_list = self._parse_options(options)
+        if not option_list or not memories:
+            return []
+
+        selected: list[MemoryRecord] = []
+        seen_ids: set[str] = set()
+
+        for option in option_list:
+            option_query = f"{question} {option}"
+            rows = self._scored_candidates(
+                memories,
+                query=option_query,
+                cache_key_prefix=f"controlled_option_{sha1(option_query.encode('utf-8')).hexdigest()[:8]}",
+            )
+            rows = sorted(rows, key=lambda r: r["score"], reverse=True)[:per_option_k]
+
+            for row in rows:
+                memory = row["memory"]
+                if memory.memory_id in seen_ids:
+                    continue
+                selected.append(memory)
+                seen_ids.add(memory.memory_id)
+
+        return selected
+
+
     def _specificity_bonus(self, memory: MemoryRecord) -> float:
         text = memory.normalized_mem_text.lower()
         tokens = self._memory_tokens(text)
@@ -313,10 +410,34 @@ class ControlledMethod:
         if question_type in EVOLUTION_QUESTION_TYPES:
             effective_k = max(self.top_k, 7)
 
-        active_rows = self._scored_candidates(
-            filtered_active,
+        dense_pool = filtered_active
+
+        bm25_records = self._bm25_retrieve(
+            dense_pool,
             query=query,
-            cache_key_prefix=f"controlled_active_{episode.get('question_id', episode.get('episode_id'))}",
+            k=20,
+        )
+
+        option_records = self._option_conditioned_candidates(
+            dense_pool,
+            question=episode.get("question", ""),
+            options=episode.get("options", ""),
+            per_option_k=3,
+        )
+
+        union_memories: list[MemoryRecord] = []
+        seen_ids: set[str] = set()
+
+        for memory in list(dense_pool) + bm25_records + option_records:
+            if memory.memory_id in seen_ids:
+                continue
+            union_memories.append(memory)
+            seen_ids.add(memory.memory_id)
+
+        active_rows = self._scored_candidates(
+            union_memories,
+            query=query,
+            cache_key_prefix=f"controlled_active_union_{episode.get('question_id', episode.get('episode_id'))}",
         )
 
         superseded_rows = self._scored_candidates(

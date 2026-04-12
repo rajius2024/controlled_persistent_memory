@@ -77,8 +77,8 @@ class VanillaRAGMethod:
         retrieved_scores = [r["sim_score"] for r in retrieved]
         stored_count = len(turns)
         superseded_count = 0
+
         return pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count
-        
 
 
 def build_output_path(method_name: str, out_dir: str) -> str:
@@ -139,15 +139,23 @@ def main():
 
     out_path = build_output_path(args.method, args.out_dir)
 
-
     correct = 0
     total = 0
+
     with open(out_path, "w", encoding="utf-8") as out:
         for ep in iter_jsonl(args.episodes_path):
             start = time.time()
-            pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count = method.answer(ep)
+            (
+                pred,
+                raw_text,
+                retrieved_texts,
+                retrieved_scores,
+                stored_count,
+                superseded_count,
+            ) = method.answer(ep)
             elapsed = time.time() - start
             print(f"[eval] episode {ep.get('episode_id')} took {elapsed:.2f}s", flush=True)
+
             gold = normalize_label(ep.get("answer", ""))
             correct_flag = is_correct(pred, gold)
             correct += int(correct_flag)
@@ -157,31 +165,46 @@ def main():
 
             if args.method == "vanilla_rag":
                 stored_count = len(ep.get("turns", []))
-
             elif args.method == "controlled" and getattr(method, "last_trace", None):
-                stored_count = method.last_trace.get("stored_memories_count", 0)
-                superseded_count = method.last_trace.get("superseded_count", 0)
+                stored_count = method.last_trace.get("stored_memories_count", stored_count)
+                superseded_count = method.last_trace.get("superseded_count", superseded_count)
                 contradiction_count = method.last_trace.get("contradiction_count", 0)
 
             record = {
+                # Core eval info
                 "episode_id": ep.get("episode_id"),
                 "question_id": ep.get("question_id"),
+                "shared_context_id": ep.get("shared_context_id"),
+                "persona_id": ep.get("persona_id"),
                 "method": args.method,
                 "prediction_raw": raw_text,
                 "prediction": pred,
                 "gold_raw": ep.get("answer", ""),
                 "gold": gold,
                 "correct": correct_flag,
+
+                # Retrieval / memory logs
                 "retrieved": retrieved_texts,
                 "retrieved_scores": retrieved_scores,
                 "stored_count": stored_count,
                 "retrieved_count": len(retrieved_texts),
                 "superseded_count": superseded_count,
-                "contradiction_count":contradiction_count,
-                "question_type": ep.get("question_type"),
-                "topic": ep.get("topic", ""),
+                "contradiction_count": contradiction_count,
+
+                # Run settings
                 "k": args.k,
                 "token_cap": args.token_cap,
+
+                # Scenario breakdown variables
+                "question_type": ep.get("question_type"),
+                "topic": ep.get("topic", ""),
+                "context_length_in_tokens": ep.get("context_length_in_tokens"),
+                "context_length_in_letters": ep.get("context_length_in_letters"),
+                "distance_to_ref_in_blocks": ep.get("distance_to_ref_in_blocks"),
+                "distance_to_ref_in_tokens": ep.get("distance_to_ref_in_tokens"),
+                "num_irrelevant_tokens": ep.get("num_irrelevant_tokens"),
+                "distance_to_ref_proportion_in_context": ep.get("distance_to_ref_proportion_in_context"),
+                "end_index_in_shared_context": ep.get("end_index_in_shared_context"),
             }
 
             out.write(json.dumps(record) + "\n")

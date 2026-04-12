@@ -3,10 +3,5 @@ __pycache__/
 *.pyc
 .cache/
 runs/
-results/
-results_compare/
-results_compare_small/
-results_debug/
-results_debug_v2/
 tmp/
 *.log
