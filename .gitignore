@@ -5,3 +5,6 @@ __pycache__/
 runs/
 tmp/
 *.log
+results/controlled_runs/*/chromadb/
+.env
+Persona MEM/
