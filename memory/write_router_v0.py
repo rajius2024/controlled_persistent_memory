@@ -290,7 +290,7 @@ class GroqWriteGate:
     def __init__(
         self,
         model_name: str | None = None,
-        max_completion_tokens: int = 96,
+        max_completion_tokens: int = 64,
         api_key: str | None = None,
     ):
         self.model_name = model_name or os.environ.get(
@@ -316,7 +316,7 @@ class GroqWriteGate:
         return text[start : end + 1]
 
     def extract_candidates(self, utterance: str) -> list[dict[str, Any]]:
-        cache_key = utterance.strip()
+        cache_key = f"{self.model_name}||{self.max_completion_tokens}||{utterance.strip()}"
         if cache_key in self.cache:
             return self.cache[cache_key]
 

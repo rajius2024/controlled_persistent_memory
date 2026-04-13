@@ -81,14 +81,9 @@ class VanillaRAGMethod:
         return pred, raw_text, retrieved_texts, retrieved_scores, stored_count, superseded_count
 
 
-def build_output_path(method_name: str, out_dir: str) -> str:
-    filename_map = {
-        "no_memory": "no_memory_dev10.jsonl",
-        "vanilla_rag": "vanilla_rag_dev10.jsonl",
-        "controlled": "controlled_dev10.jsonl",
-    }
-    return os.path.join(out_dir, filename_map[method_name])
-
+def build_output_path(method_name: str, out_dir: str, episodes_path: str) -> str:
+    dataset_stem = os.path.splitext(os.path.basename(episodes_path))[0]
+    return os.path.join(out_dir, f"{method_name}_{dataset_stem}.jsonl")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -137,7 +132,7 @@ def main():
             top_k=args.k,
         )
 
-    out_path = build_output_path(args.method, args.out_dir)
+    out_path = build_output_path(args.method, args.out_dir, args.episodes_path)
 
     correct = 0
     total = 0

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 import math
+import re
 import shutil
 from collections import Counter
 from hashlib import sha1
@@ -119,7 +119,7 @@ class ControlledMethod:
             k=self.top_k,
         )
 
-        retrieved_texts = [m.normalized_mem_text for m in retrieved_records]
+        retrieved_texts = [self._retrieval_text(m) for m in retrieved_records]
 
         prompt = self._build_prompt(episode, retrieved_records)
         raw_text = call_llm(prompt)
@@ -210,92 +210,23 @@ class ControlledMethod:
         )
         return [m.strip() for m in matches if m.strip()]
 
+    def _retrieval_text(self, memory: MemoryRecord) -> str:
+        canonical = memory.normalized_mem_text
+        provenance = str(memory.metadata.get("provenance_text", "")).strip()
+        status = str(memory.status)
+        if provenance:
+            return f"{canonical}. Status: {status}. Evidence: {provenance}"
+        return f"{canonical}. Status: {status}"
 
-    def _bm25_retrieve(
-        self,
-        memories: list[MemoryRecord],
-        query: str,
-        k: int = 20,
-    ) -> list[MemoryRecord]:
-        if not memories:
-            return []
-
-        query_terms = list(self._memory_tokens(query))
-        if not query_terms:
-            return []
-
-        docs: list[list[str]] = []
-        doc_freq: Counter[str] = Counter()
-
-        for memory in memories:
-            tokens = list(self._memory_tokens(memory.normalized_mem_text))
-            docs.append(tokens)
-            for term in set(tokens):
-                doc_freq[term] += 1
-
-        N = len(docs)
-        avgdl = sum(len(doc) for doc in docs) / max(N, 1)
-
-        k1 = 1.5
-        b = 0.75
-
-        scored: list[tuple[float, MemoryRecord]] = []
-
-        for memory, doc in zip(memories, docs):
-            doc_len = len(doc)
-            tf = Counter(doc)
-            score = 0.0
-
-            for term in query_terms:
-                if term not in tf:
-                    continue
-
-                df = doc_freq.get(term, 0)
-                idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-                freq = tf[term]
-
-                denom = freq + k1 * (1 - b + b * doc_len / max(avgdl, 1e-9))
-                score += idf * (freq * (k1 + 1)) / max(denom, 1e-9)
-
-            if score > 0.0:
-                scored.append((score, memory))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [memory for _, memory in scored[:k]]
-
-
-    def _option_conditioned_candidates(
-        self,
-        memories: list[MemoryRecord],
-        question: str,
-        options: str,
-        per_option_k: int = 3,
-    ) -> list[MemoryRecord]:
-        option_list = self._parse_options(options)
-        if not option_list or not memories:
-            return []
-
-        selected: list[MemoryRecord] = []
-        seen_ids: set[str] = set()
-
-        for option in option_list:
-            option_query = f"{question} {option}"
-            rows = self._scored_candidates(
-                memories,
-                query=option_query,
-                cache_key_prefix=f"controlled_option_{sha1(option_query.encode('utf-8')).hexdigest()[:8]}",
-            )
-            rows = sorted(rows, key=lambda r: r["score"], reverse=True)[:per_option_k]
-
-            for row in rows:
-                memory = row["memory"]
-                if memory.memory_id in seen_ids:
-                    continue
-                selected.append(memory)
-                seen_ids.add(memory.memory_id)
-
-        return selected
-
+    def _query_focus_mode(self, episode: dict[str, Any]) -> str:
+        qtype = episode.get("question_type", "") or ""
+        if qtype == "recall_user_shared_facts":
+            return "raw_recall"
+        if qtype in EVOLUTION_QUESTION_TYPES:
+            return "timeline"
+        if qtype in {"bookRecommendation", "musicRecommendation"}:
+            return "slot_pref"
+        return "default"
 
     def _specificity_bonus(self, memory: MemoryRecord) -> float:
         text = memory.normalized_mem_text.lower()
@@ -336,20 +267,117 @@ class ControlledMethod:
 
         return penalty
 
-    def _rerank_score(self, semantic_score: float, memory: MemoryRecord) -> float:
+    def _evidence_bonus(self, memory: MemoryRecord, query: str) -> float:
+        provenance = str(memory.metadata.get("provenance_text", "")).lower()
+        if not provenance:
+            return 0.0
+
+        query_tokens = self._memory_tokens(query)
+        prov_tokens = self._memory_tokens(provenance)
+        if not query_tokens or not prov_tokens:
+            return 0.0
+
+        overlap = len(query_tokens & prov_tokens) / max(len(query_tokens), 1)
+        return 0.12 * overlap
+
+    def _temporal_score(self, memory: MemoryRecord, episode: dict[str, Any]) -> float:
+        qtype = episode.get("question_type", "") or ""
+        text = memory.normalized_mem_text.lower()
+        status = str(memory.status)
+
+        score = 0.0
+
+        if qtype in EVOLUTION_QUESTION_TYPES:
+            if "superseded" in status.lower():
+                score += 0.08
+            if memory.metadata.get("update_hint", False):
+                score += 0.08
+        else:
+            if "active" in status.lower():
+                score += 0.05
+            if "superseded" in status.lower():
+                score -= 0.03
+
+        if any(phrase in text for phrase in ["used to", "no longer", "stopped", "not anymore"]):
+            if qtype in EVOLUTION_QUESTION_TYPES:
+                score += 0.08
+            else:
+                score -= 0.04
+
+        return score
+
+    def _rerank_score(self, semantic_score: float, memory: MemoryRecord, query: str, episode: dict[str, Any]) -> float:
         specificity = float(memory.metadata.get("specificity_score", 0.0))
-        return semantic_score + self._specificity_bonus(memory) - self._generic_penalty(memory) + 0.15 * specificity
+        return (
+            semantic_score
+            + self._specificity_bonus(memory)
+            - self._generic_penalty(memory)
+            + 0.15 * specificity
+            + self._evidence_bonus(memory, query)
+            + self._temporal_score(memory, episode)
+        )
+
+    def _bm25_retrieve(
+        self,
+        memories: list[MemoryRecord],
+        query: str,
+        k: int = 20,
+    ) -> list[MemoryRecord]:
+        if not memories:
+            return []
+
+        docs: list[list[str]] = []
+        doc_freq: Counter[str] = Counter()
+        query_terms = list(self._memory_tokens(query))
+        if not query_terms:
+            return []
+
+        for memory in memories:
+            tokens = list(self._memory_tokens(self._retrieval_text(memory)))
+            docs.append(tokens)
+            for term in set(tokens):
+                doc_freq[term] += 1
+
+        N = len(docs)
+        avgdl = sum(len(doc) for doc in docs) / max(N, 1)
+
+        k1 = 1.5
+        b = 0.75
+
+        scored: list[tuple[float, MemoryRecord]] = []
+
+        for memory, doc in zip(memories, docs):
+            doc_len = len(doc)
+            tf = Counter(doc)
+            score = 0.0
+
+            for term in query_terms:
+                if term not in tf:
+                    continue
+
+                df = doc_freq.get(term, 0)
+                idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                freq = tf[term]
+                denom = freq + k1 * (1 - b + b * doc_len / max(avgdl, 1e-9))
+                score += idf * (freq * (k1 + 1)) / max(denom, 1e-9)
+
+            if score > 0.0:
+                scored.append((score, memory))
+
+        scored.sort(key=lambda x: (x[0], x[1].memory_id), reverse=True)
+        return [memory for _, memory in scored[:k]]
 
     def _scored_candidates(
         self,
         memories: list[MemoryRecord],
         query: str,
         cache_key_prefix: str,
+        episode: dict[str, Any],
     ) -> list[dict[str, Any]]:
         if not memories:
             return []
 
-        texts = [m.normalized_mem_text for m in memories]
+        texts = [self._retrieval_text(m) for m in memories]
         fingerprint = sha1("||".join(texts).encode("utf-8")).hexdigest()[:16]
         cache_key = f"{cache_key_prefix}_{fingerprint}"
 
@@ -360,7 +388,7 @@ class ControlledMethod:
         rows: list[dict[str, Any]] = []
         for i, memory in enumerate(memories):
             semantic = float(semantic_scores[i])
-            final = self._rerank_score(semantic, memory)
+            final = self._rerank_score(semantic, memory, query, episode)
             rows.append(
                 {
                     "memory": memory,
@@ -373,6 +401,137 @@ class ControlledMethod:
             )
         return rows
 
+    def _option_conditioned_rows(
+        self,
+        memories: list[MemoryRecord],
+        question: str,
+        options: str,
+        episode: dict[str, Any],
+        per_option_k: int = 4,
+    ) -> list[dict[str, Any]]:
+        option_list = self._parse_options(options)
+        if not option_list or not memories:
+            return []
+
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for option in option_list:
+            option_query = f"{question} {option}"
+            rows = self._scored_candidates(
+                memories,
+                query=option_query,
+                cache_key_prefix=f"controlled_option_{sha1(option_query.encode('utf-8')).hexdigest()[:8]}",
+                episode=episode,
+            )
+            rows = sorted(rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)[:per_option_k]
+
+            for row in rows:
+                mem_id = row["memory"].memory_id
+                if mem_id in seen:
+                    continue
+                out.append(row)
+                seen.add(mem_id)
+
+        return out
+
+    def _rrf_fuse(
+        self,
+        ranked_lists: list[list[dict[str, Any]]],
+        k: int = 60,
+    ) -> list[dict[str, Any]]:
+        fused: dict[str, dict[str, Any]] = {}
+
+        for ranked in ranked_lists:
+            for rank, row in enumerate(ranked, start=1):
+                mem = row["memory"]
+                mem_id = mem.memory_id
+                score_add = 1.0 / (k + rank)
+
+                if mem_id not in fused:
+                    fused[mem_id] = {
+                        "memory": mem,
+                        "rrf_score": 0.0,
+                        "best_semantic_score": float(row.get("semantic_score", 0.0)),
+                        "best_score": float(row.get("score", 0.0)),
+                        "status": row.get("status"),
+                        "polarity": row.get("polarity"),
+                        "target_kind": row.get("target_kind"),
+                    }
+
+                fused[mem_id]["rrf_score"] += score_add
+                fused[mem_id]["best_semantic_score"] = max(
+                    fused[mem_id]["best_semantic_score"],
+                    float(row.get("semantic_score", 0.0)),
+                )
+                fused[mem_id]["best_score"] = max(
+                    fused[mem_id]["best_score"],
+                    float(row.get("score", 0.0)),
+                )
+
+        out = []
+        for _, row in fused.items():
+            out.append(
+                {
+                    "memory": row["memory"],
+                    "score": float(row["rrf_score"]) + 0.15 * float(row["best_score"]),
+                    "semantic_score": float(row["best_semantic_score"]),
+                    "status": row["status"],
+                    "polarity": row["polarity"],
+                    "target_kind": row["target_kind"],
+                }
+            )
+
+        out.sort(key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
+        return out
+
+    def _dedup_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        seen = set()
+        for row in rows:
+            mem_id = row["memory"].memory_id
+            if mem_id in seen:
+                continue
+            out.append(row)
+            seen.add(mem_id)
+        return out
+
+    def _select_diverse_slate(
+        self,
+        rows: list[dict[str, Any]],
+        budget_k: int,
+    ) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+
+        for row in rows:
+            memory = row["memory"]
+            mem_id = memory.memory_id
+            if mem_id in selected_ids:
+                continue
+
+            redundant = False
+            new_tokens = self._memory_tokens(self._retrieval_text(memory))
+            for prev in selected:
+                prev_tokens = self._memory_tokens(self._retrieval_text(prev["memory"]))
+                if not new_tokens or not prev_tokens:
+                    continue
+                jacc = len(new_tokens & prev_tokens) / max(len(new_tokens | prev_tokens), 1)
+                if jacc >= 0.80:
+                    redundant = True
+                    break
+
+            if redundant:
+                continue
+
+            selected.append(row)
+            selected_ids.add(mem_id)
+
+            if len(selected) >= budget_k:
+                break
+
+        return selected
+
     def _retrieve_top_k(
         self,
         episode: dict[str, Any],
@@ -383,143 +542,166 @@ class ControlledMethod:
         if not active_memories and not superseded_memories:
             return [], [], []
 
-        query_slot = self._infer_query_slot(
-            question=episode.get("question", ""),
-            options=episode.get("options", ""),
-        )
+        question = episode.get("question", "") or ""
+        options = episode.get("options", "") or ""
+        query = f"{question} {options}"
+        question_type = episode.get("question_type", "")
+        focus_mode = self._query_focus_mode(episode)
+
+        query_slot = self._infer_query_slot(question=question, options=options)
 
         filtered_active = active_memories
         filtered_superseded = superseded_memories
 
-        if query_slot is not None:
+        if query_slot is not None and focus_mode not in {"raw_recall"}:
             slot_active = [m for m in active_memories if m.metadata.get("slot") == query_slot]
-            if len(slot_active) >= 3:
-                filtered_active = slot_active
-            else:
-                filtered_active = active_memories
-
             slot_superseded = [m for m in superseded_memories if m.metadata.get("slot") == query_slot]
-            if len(slot_superseded) >= 2:
-                filtered_superseded = slot_superseded
-            else:
-                filtered_superseded = superseded_memories
 
-        query = f"{episode.get('question', '')} {episode.get('options', '')}"
-        question_type = episode.get("question_type", "")
+            if focus_mode == "slot_pref":
+                if slot_active:
+                    filtered_active = slot_active
+                if slot_superseded:
+                    filtered_superseded = slot_superseded
+            else:
+                if len(slot_active) >= 3:
+                    filtered_active = slot_active
+                if len(slot_superseded) >= 2:
+                    filtered_superseded = slot_superseded
+
         effective_k = self.top_k
         if question_type in EVOLUTION_QUESTION_TYPES:
             effective_k = max(self.top_k, 7)
 
-        dense_pool = filtered_active
-
-        bm25_records = self._bm25_retrieve(
-            dense_pool,
+        dense_active_rows = self._scored_candidates(
+            filtered_active,
             query=query,
-            k=20,
+            cache_key_prefix=f"controlled_dense_active_{episode.get('question_id', episode.get('episode_id'))}",
+            episode=episode,
         )
+        dense_active_rows = sorted(dense_active_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
-        option_records = self._option_conditioned_candidates(
-            dense_pool,
-            question=episode.get("question", ""),
-            options=episode.get("options", ""),
-            per_option_k=3,
-        )
-
-        union_memories: list[MemoryRecord] = []
-        seen_ids: set[str] = set()
-
-        for memory in list(dense_pool) + bm25_records + option_records:
-            if memory.memory_id in seen_ids:
-                continue
-            union_memories.append(memory)
-            seen_ids.add(memory.memory_id)
-
-        active_rows = self._scored_candidates(
-            union_memories,
+        bm25_active_records = self._bm25_retrieve(filtered_active, query=query, k=20)
+        bm25_active_rows = self._scored_candidates(
+            bm25_active_records,
             query=query,
-            cache_key_prefix=f"controlled_active_union_{episode.get('question_id', episode.get('episode_id'))}",
+            cache_key_prefix=f"controlled_bm25_active_{episode.get('question_id', episode.get('episode_id'))}",
+            episode=episode,
         )
+        bm25_active_rows = sorted(bm25_active_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
-        superseded_rows = self._scored_candidates(
-            filtered_superseded,
+        option_rows = self._option_conditioned_rows(
+            filtered_active,
+            question=question,
+            options=options,
+            episode=episode,
+            per_option_k=4,
+        )
+        option_rows = sorted(option_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
+
+        temporal_pool = filtered_active + filtered_superseded if focus_mode == "timeline" else filtered_active
+        temporal_rows = self._scored_candidates(
+            temporal_pool,
             query=query,
-            cache_key_prefix=f"controlled_superseded_{episode.get('question_id', episode.get('episode_id'))}",
+            cache_key_prefix=f"controlled_temporal_{episode.get('question_id', episode.get('episode_id'))}",
+            episode=episode,
+        )
+        temporal_rows = sorted(
+            temporal_rows,
+            key=lambda r: (self._temporal_score(r["memory"], episode), r["score"], r["memory"].memory_id),
+            reverse=True,
         )
 
-        if question_type in EVOLUTION_QUESTION_TYPES:
-            pos_active = [r for r in active_rows if r["polarity"] == "positive"]
-            neg_active = [r for r in active_rows if r["polarity"] == "negative"]
-            neutral_active = [r for r in active_rows if r["polarity"] not in {"positive", "negative"}]
+        if focus_mode == "timeline":
+            ranked_lists = [
+                dense_active_rows[:20],
+                bm25_active_rows[:20],
+                option_rows[:20],
+                temporal_rows[:20],
+            ]
+            fused_rows = self._rrf_fuse(ranked_lists)
+            fused_rows = self._dedup_rows(fused_rows)
 
-            pos_active.sort(key=lambda r: r["score"], reverse=True)
-            neg_active.sort(key=lambda r: r["score"], reverse=True)
-            neutral_active.sort(key=lambda r: r["score"], reverse=True)
-            superseded_rows.sort(key=lambda r: r["score"], reverse=True)
+            pos_rows = [r for r in fused_rows if r["polarity"] == "positive"]
+            neg_rows = [r for r in fused_rows if r["polarity"] == "negative"]
+            sup_rows = [r for r in fused_rows if "superseded" in str(r["memory"].status).lower()]
 
             chosen_rows: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
 
-            # Force some trajectory shape.
-            if pos_active:
-                chosen_rows.append(pos_active[0])
-            if neg_active:
-                chosen_rows.append(neg_active[0])
-            if superseded_rows:
-                chosen_rows.append(superseded_rows[0])
+            for bucket in [pos_rows, neg_rows, sup_rows]:
+                if bucket:
+                    row = bucket[0]
+                    mem_id = row["memory"].memory_id
+                    if mem_id not in seen_ids:
+                        chosen_rows.append(row)
+                        seen_ids.add(mem_id)
 
-            seen_ids = {r["memory"].memory_id for r in chosen_rows}
-
-            remaining = sorted(
-                active_rows + superseded_rows,
-                key=lambda r: r["score"],
-                reverse=True,
-            )
-            for row in remaining:
-                if row["memory"].memory_id in seen_ids:
+            for row in fused_rows:
+                mem_id = row["memory"].memory_id
+                if mem_id in seen_ids:
                     continue
                 chosen_rows.append(row)
-                seen_ids.add(row["memory"].memory_id)
-                if len(chosen_rows) >= min(effective_k, len(active_rows) + len(superseded_rows)):
+                seen_ids.add(mem_id)
+                if len(chosen_rows) >= max(effective_k, 7):
                     break
-        else:
-            all_rows = sorted(active_rows, key=lambda r: r["score"], reverse=True)
-            chosen_rows = all_rows[: min(effective_k, len(all_rows))]
 
-        if len(chosen_rows) < 5:
+            chosen_rows = self._select_diverse_slate(chosen_rows, effective_k)
+            all_debug_rows = fused_rows
+
+        else:
+            if focus_mode == "raw_recall":
+                ranked_lists = [
+                    dense_active_rows[:25],
+                    bm25_active_rows[:25],
+                    option_rows[:25],
+                ]
+            else:
+                ranked_lists = [
+                    dense_active_rows[:20],
+                    bm25_active_rows[:20],
+                    option_rows[:20],
+                    temporal_rows[:20],
+                ]
+
+            fused_rows = self._rrf_fuse(ranked_lists)
+            fused_rows = self._dedup_rows(fused_rows)
+            chosen_rows = self._select_diverse_slate(fused_rows, effective_k)
+            all_debug_rows = fused_rows
+
+        if len(chosen_rows) < min(5, effective_k):
             fallback_rows = self._scored_candidates(
                 active_memories,
                 query=query,
                 cache_key_prefix=f"controlled_fallback_{episode.get('question_id', episode.get('episode_id'))}",
+                episode=episode,
             )
-            fallback_rows = sorted(fallback_rows, key=lambda r: r["score"], reverse=True)
+            fallback_rows = sorted(fallback_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
-            seen_ids = {row["memory"].memory_id for row in chosen_rows}
-            merged_rows = list(chosen_rows)
+            merged = chosen_rows[:]
+            seen = {row["memory"].memory_id for row in merged}
 
             for row in fallback_rows:
                 mem_id = row["memory"].memory_id
-                if mem_id in seen_ids:
+                if mem_id in seen:
                     continue
-                merged_rows.append(row)
-                seen_ids.add(mem_id)
-                if len(merged_rows) >= effective_k:
+                merged.append(row)
+                seen.add(mem_id)
+                if len(merged) >= effective_k:
                     break
 
-            chosen_rows = merged_rows[: min(effective_k, len(merged_rows))]
-
+            chosen_rows = self._select_diverse_slate(merged, effective_k)
 
         retrieved_records = [row["memory"] for row in chosen_rows]
         retrieved_scores = [float(row["score"]) for row in chosen_rows]
 
         retrieval_debug = []
-        all_debug_rows = active_rows + superseded_rows
-        all_debug_rows.sort(key=lambda r: r["score"], reverse=True)
-
         for row in all_debug_rows:
             memory = row["memory"]
             retrieval_debug.append(
                 {
                     "memory_id": memory.memory_id,
                     "text": memory.normalized_mem_text,
+                    "retrieval_text": self._retrieval_text(memory),
                     "score": float(row["score"]),
                     "semantic_score": float(row["semantic_score"]),
                     "slot": memory.metadata.get("slot"),
@@ -538,13 +720,14 @@ class ControlledMethod:
             for memory in retrieved_records:
                 canonical = memory.normalized_mem_text
                 provenance = str(memory.metadata.get("provenance_text", "")).strip()
+                status = str(memory.status)
+
+                block = [f"- Memory: {canonical}", f"  Status: {status}"]
                 if provenance:
-                    memory_lines.append(
-                        f"- Memory: {canonical}\n"
-                        f"  Evidence: {provenance}"
-                    )
-                else:
-                    memory_lines.append(f"- Memory: {canonical}")
+                    block.append(f"  Evidence: {provenance}")
+
+                memory_lines.append("\n".join(block))
+
             memories_block = "\n".join(memory_lines)
         else:
             memories_block = "None"
@@ -553,12 +736,13 @@ class ControlledMethod:
         options = episode.get("options", "") or ""
 
         return (
-            f"Below are the user's relevant memories and supporting evidence:\n\n"
-            f"{memories_block}\n\n"
-            f"Use both the memory statements and their evidence to answer the question.\n"
+            "You are answering a multiple-choice question about a user.\n\n"
+            "Use the retrieved memories and evidence carefully.\n"
+            "Prefer ACTIVE memories as the user's current state.\n"
+            "Use older or superseded evidence only when the question asks about change over time, "
+            "reasons for updates, or preference evolution.\n\n"
+            f"Retrieved memories:\n{memories_block}\n\n"
             f"Question: {question}\n"
             f"Options:\n{options}\n\n"
-            f"Output format must be EXACTLY one of: (a) (b) (c) (d). No other text."
+            "Return EXACTLY one of: (a) (b) (c) (d). No other text."
         )
-
-
