@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Optional
+
+import numpy as np
+
+from baselines.embeddings import embed_one
+from memory.schema import MemoryRecord, MemoryStatus
+from memory.store_interface import MemoryStore
+
+
+STOPWORDS = {
+    "a", "an", "the", "my", "your", "i", "it", "is", "in", "of", "and", "or",
+    "to", "for", "with", "on", "at", "this", "that", "these", "those",
+    "over", "than",
+}
+
+GENERIC_PATTERNS = {
+    "likes music",
+    "interested in music",
+    "likes books",
+    "interested in literature",
+    "appreciates literature",
+    "likes reading",
+    "book lover",
+}
+
+PREFIXES = [
+    "likes ",
+    "dislikes ",
+    "prefers ",
+    "usually ",
+    "is ",
+    "interested in ",
+    "values ",
+    "enjoys ",
+    "produces ",
+    "creates ",
+    "focuses on ",
+    "started ",
+    "hosts ",
+    "joined ",
+    "practices ",
+]
+
+
+@dataclass
+class VersioningResult:
+    stored_record: MemoryRecord
+    superseded_ids: list[str]
+    conflict_bucket: Optional[str] = None
+    contradiction_count: int = 0
+    wrote_new: bool = True
+    duplicate_of: Optional[str] = None
+
+
+def _status_value(value: object) -> str:
+    if isinstance(value, MemoryStatus):
+        return value.value
+    return str(value)
+
+
+def conflict_bucket(record: MemoryRecord) -> str:
+    slot = record.metadata.get("slot")
+    kind = record.metadata.get("target_kind")
+    if slot and kind:
+        return f"{slot}::{kind}"
+    if slot:
+        return f"{slot}::{record.memory_type}"
+    if record.memory_type:
+        return record.memory_type
+    return "general_preference"
+
+
+def _same_persona(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.persona_id == new.persona_id
+
+
+def _same_slot(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("slot", "general") == new.metadata.get("slot", "general")
+
+
+def _same_target_kind(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("target_kind", "topic") == new.metadata.get("target_kind", "topic")
+
+
+def _same_polarity(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("polarity") == new.metadata.get("polarity")
+
+
+def _normalize_target_text(text: str) -> str:
+    lowered = text.strip().lower()
+    for prefix in PREFIXES:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix):].strip()
+    return lowered
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in STOPWORDS
+    }
+
+
+def _target_overlap(existing: MemoryRecord, new: MemoryRecord) -> float:
+    a = _token_set(_normalize_target_text(existing.normalized_mem_text))
+    b = _token_set(_normalize_target_text(new.normalized_mem_text))
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+@lru_cache(maxsize=4096)
+def _embed_text_cached(text: str) -> tuple[float, ...]:
+    vec = embed_one(text)
+    if hasattr(vec, "tolist"):
+        vec = vec.tolist()
+    return tuple(float(x) for x in vec)
+
+
+def _embedding_similarity(text_a: str, text_b: str) -> float:
+    a = np.array(_embed_text_cached(text_a), dtype=float)
+    b = np.array(_embed_text_cached(text_b), dtype=float)
+
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+    if a_norm == 0.0 or b_norm == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (a_norm * b_norm))
+
+
+def _record_similarity(existing: MemoryRecord, new: MemoryRecord) -> float:
+    a = _normalize_target_text(existing.normalized_mem_text)
+    b = _normalize_target_text(new.normalized_mem_text)
+    return _embedding_similarity(a, b)
+
+
+def _is_exact_duplicate(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.normalized_mem_text.strip().lower() == new.normalized_mem_text.strip().lower()
+
+
+def _is_opposition(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    existing_polarity = existing.metadata.get("polarity")
+    new_polarity = new.metadata.get("polarity")
+    return (
+        existing_polarity == "positive" and new_polarity == "negative"
+    ) or (
+        existing_polarity == "negative" and new_polarity == "positive"
+    )
+
+
+def _single_value_slot(record: MemoryRecord) -> bool:
+    slot = record.metadata.get("slot", "general")
+    kind = record.metadata.get("target_kind", "topic")
+
+    if kind in {"social_style", "profile"}:
+        return True
+
+    if slot in {"communication", "schedule", "location", "profile"}:
+        return True
+
+    return False
+
+
+def _is_generic_memory(record: MemoryRecord) -> bool:
+    text = record.normalized_mem_text.strip().lower()
+    if text in GENERIC_PATTERNS:
+        return True
+
+    tokens = _token_set(_normalize_target_text(text))
+    return len(tokens) <= 2
+
+
+def _specificity_score(record: MemoryRecord) -> float:
+    text = record.normalized_mem_text.strip().lower()
+    tokens = _token_set(_normalize_target_text(text))
+
+    score = 0.0
+    score += min(len(tokens), 8) * 0.12
+
+    if any(word in text for word in ["producing", "creates", "started", "hosts", "joined", "volunteers", "visits", "uses", "focuses"]):
+        score += 0.45
+
+    if any(word in text for word in ["electronic", "pacific", "classic", "indie", "original", "instrument", "instruments"]):
+        score += 0.30
+
+    target_kind = record.metadata.get("target_kind")
+    if target_kind == "routine":
+        score += 0.15
+    if target_kind == "profile":
+        score += 0.10
+
+    if _is_generic_memory(record):
+        score -= 0.40
+
+    return score
+
+
+def _is_embedding_duplicate(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    if not _same_slot(existing, new):
+        return False
+    if not _same_target_kind(existing, new):
+        return False
+    if not _same_polarity(existing, new):
+        return False
+
+    token_overlap = _target_overlap(existing, new)
+    sim = _record_similarity(existing, new)
+
+    # Very high semantic similarity means these are essentially the same memory.
+    if sim >= 0.93:
+        return True
+
+    # Slightly lower embedding similarity plus meaningful lexical overlap.
+    if sim >= 0.88 and token_overlap >= 0.25:
+        return True
+
+    return False
+
+
+def _prefer_existing_specific(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    if not _same_slot(existing, new):
+        return False
+    if not _same_target_kind(existing, new):
+        return False
+    if not _same_polarity(existing, new):
+        return False
+
+    sim = _record_similarity(existing, new)
+    token_overlap = _target_overlap(existing, new)
+
+    # Skip new broad memory if existing is clearly more specific and semantically close.
+    if _is_generic_memory(new) and not _is_generic_memory(existing):
+        if sim >= 0.82 or token_overlap >= 0.35:
+            return True
+
+    # If both are semantically close, prefer the more specific one.
+    existing_spec = _specificity_score(existing)
+    new_spec = _specificity_score(new)
+
+    if sim >= 0.86 and existing_spec >= new_spec + 0.35:
+        return True
+
+    return False
+
+
+def memories_conflict(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    if not _same_persona(existing, new):
+        return False
+    if _status_value(existing.status) != MemoryStatus.ACTIVE.value:
+        return False
+    if not _same_slot(existing, new):
+        return False
+    if _is_exact_duplicate(existing, new):
+        return False
+
+    overlap = _target_overlap(existing, new)
+    sim = _record_similarity(existing, new)
+
+    if _single_value_slot(new) and _same_target_kind(existing, new):
+        return True
+
+    if new.metadata.get("update_hint", False) and _same_target_kind(existing, new):
+        if overlap >= 0.35 or sim >= 0.82:
+            return True
+
+    if _is_opposition(existing, new):
+        if overlap >= 0.30 or sim >= 0.80:
+            return True
+
+    # Near-duplicate same-polarity memories in the same bucket should be compressed.
+    if _same_target_kind(existing, new) and _same_polarity(existing, new):
+        if sim >= 0.89 and overlap >= 0.20:
+            return True
+
+    return False
+
+
+def _prefer_new_record(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    existing_spec = _specificity_score(existing)
+    new_spec = _specificity_score(new)
+
+    if new_spec >= existing_spec + 0.35:
+        return True
+    if existing_spec >= new_spec + 0.35:
+        return False
+
+    # If specificity is close, prefer the newer one.
+    return new.turn_index >= existing.turn_index
+
+
+def add_memory(record: MemoryRecord, store: MemoryStore) -> VersioningResult:
+    active_candidates = store.list_memories(
+        persona_id=record.persona_id,
+        status=MemoryStatus.ACTIVE.value,
+    )
+
+    for existing in active_candidates:
+        if _is_exact_duplicate(existing, record) or _is_embedding_duplicate(existing, record):
+            return VersioningResult(
+                stored_record=existing,
+                superseded_ids=[],
+                conflict_bucket=conflict_bucket(existing),
+                contradiction_count=0,
+                wrote_new=False,
+                duplicate_of=existing.memory_id,
+            )
+
+        if _prefer_existing_specific(existing, record):
+            return VersioningResult(
+                stored_record=existing,
+                superseded_ids=[],
+                conflict_bucket=conflict_bucket(existing),
+                contradiction_count=0,
+                wrote_new=False,
+                duplicate_of=existing.memory_id,
+            )
+
+    conflicts = [memory for memory in active_candidates if memories_conflict(memory, record)]
+
+    superseded_ids: list[str] = []
+    replacement_link: Optional[str] = record.supersession_link
+
+    winning_conflicts: list[MemoryRecord] = []
+    losing_conflicts: list[MemoryRecord] = []
+
+    for old in conflicts:
+        if _prefer_new_record(old, record):
+            losing_conflicts.append(old)
+        else:
+            winning_conflicts.append(old)
+
+    # If existing memories are clearly better, do not add the new one.
+    if winning_conflicts and not losing_conflicts:
+        best_existing = max(winning_conflicts, key=_specificity_score)
+        return VersioningResult(
+            stored_record=best_existing,
+            superseded_ids=[],
+            conflict_bucket=conflict_bucket(best_existing),
+            contradiction_count=0,
+            wrote_new=False,
+            duplicate_of=best_existing.memory_id,
+        )
+
+    if losing_conflicts:
+        most_recent_conflict = max(losing_conflicts, key=lambda memory: memory.turn_index)
+        replacement_link = most_recent_conflict.memory_id
+
+        for old in losing_conflicts:
+            store.supersede_memory(old.memory_id, replacement_id=record.memory_id)
+            superseded_ids.append(old.memory_id)
+
+    final_record = record.model_copy(
+        update={
+            "status": MemoryStatus.ACTIVE,
+            "supersession_link": replacement_link,
+        }
+    )
+    stored = store.put_memory(final_record)
+
+    contradiction_count = sum(
+        1
+        for old in losing_conflicts
+        if _is_opposition(old, final_record)
+        and (_target_overlap(old, final_record) >= 0.30 or _record_similarity(old, final_record) >= 0.80)
+    )
+
+    return VersioningResult(
+        stored_record=stored,
+        superseded_ids=superseded_ids,
+        conflict_bucket=conflict_bucket(final_record),
+        contradiction_count=contradiction_count,
+        wrote_new=True,
+        duplicate_of=None,
+    )

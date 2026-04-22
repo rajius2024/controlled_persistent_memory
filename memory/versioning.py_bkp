@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from memory.schema import MemoryRecord, MemoryStatus
+from memory.store_interface import MemoryStore
+
+
+@dataclass
+class VersioningResult:
+    stored_record: MemoryRecord
+    superseded_ids: list[str]
+    conflict_bucket: Optional[str] = None
+    contradiction_count: int = 0
+
+
+def _status_value(value: object) -> str:
+    if isinstance(value, MemoryStatus):
+        return value.value
+    return str(value)
+
+
+def conflict_bucket(record: MemoryRecord) -> str:
+    slot = record.metadata.get("slot")
+    if slot:
+        return f"{slot}::{record.memory_type}"
+    if record.memory_type:
+        return record.memory_type
+    return "general_preference"
+
+
+def _same_slot(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.metadata.get("slot", "general") == new.metadata.get("slot", "general")
+
+
+def _same_type(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.memory_type == new.memory_type
+
+
+def _same_persona(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.persona_id == new.persona_id
+
+
+def _is_duplicate(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    return existing.normalized_mem_text.strip().lower() == new.normalized_mem_text.strip().lower()
+
+
+def _is_opposition(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    existing_pol = existing.metadata.get("polarity")
+    new_pol = new.metadata.get("polarity")
+
+    return (
+        existing_pol == "positive" and new_pol == "negative"
+    ) or (
+        existing_pol == "negative" and new_pol == "positive"
+    )
+
+
+def memories_conflict(existing: MemoryRecord, new: MemoryRecord) -> bool:
+    if not _same_persona(existing, new):
+        return False
+
+    if _status_value(existing.status) != MemoryStatus.ACTIVE.value:
+        return False
+
+    if _is_duplicate(existing, new):
+        return False
+
+    if not _same_slot(existing, new):
+        return False
+
+    if new.metadata.get("update_hint", False):
+        return True
+
+    if _is_opposition(existing, new):
+        return True
+
+    if _same_type(existing, new):
+        return True
+
+    return False
+
+
+def add_memory(record: MemoryRecord, store: MemoryStore) -> VersioningResult:
+    active_candidates = store.list_memories(
+        persona_id=record.persona_id,
+        status=MemoryStatus.ACTIVE.value,
+    )
+
+    conflicts = [m for m in active_candidates if memories_conflict(m, record)]
+
+    superseded_ids: list[str] = []
+    replacement_link: Optional[str] = record.supersession_link
+
+    if conflicts:
+        most_recent_conflict = max(conflicts, key=lambda m: m.turn_index)
+        replacement_link = most_recent_conflict.memory_id
+
+        for old in conflicts:
+            store.supersede_memory(old.memory_id, replacement_id=record.memory_id)
+            superseded_ids.append(old.memory_id)
+
+    final_record = record.model_copy(
+        update={
+            "status": MemoryStatus.ACTIVE,
+            "supersession_link": replacement_link,
+        }
+    )
+    stored = store.put_memory(final_record)
+
+    contradiction_count = 0
+    for old in conflicts:
+        if _is_opposition(old, final_record):
+            contradiction_count += 1
+
+    return VersioningResult(
+        stored_record=stored,
+        superseded_ids=superseded_ids,
+        conflict_bucket=conflict_bucket(final_record),
+        contradiction_count=contradiction_count,
+    )
