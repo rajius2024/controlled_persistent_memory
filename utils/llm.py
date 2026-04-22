@@ -119,4 +119,3 @@ if __name__ == "__main__":
     print(f"Raw response  : {resp!r}")
     print(f"Normalized    : {normalize_label(resp)}")
     print(f"Is correct (a): {is_correct(resp, '(a)')}")
-vnaruvan@VNS:/mnt/c/Users/vaaru/controlled_persistent_memory-backup/utils$
