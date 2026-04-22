@@ -3,18 +3,21 @@ Shared LLM Utility
 ==================
 Single call_llm() used by ALL methods and eval scripts.
 """
+
 import os
 import re
 import time
+
 from groq import Groq
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_TOKENS = 12
 TEMPERATURE = 0.0
 MAX_RETRIES = 4
 RATE_LIMIT_SLEEP = 5.0
 
 _client = None
+
 
 def _get_client():
     global _client
@@ -51,6 +54,7 @@ def call_llm(prompt: str, system: str = None) -> str:
             "Return EXACTLY one of: (a) (b) (c) (d). "
             "Do not return any other text."
         )
+
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
@@ -66,6 +70,7 @@ def call_llm(prompt: str, system: str = None) -> str:
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE,
             )
+
             if not resp or not getattr(resp, "choices", None):
                 print("[LLM ERROR] Empty response object")
                 time.sleep(1.0 * (attempt + 1))
@@ -107,9 +112,11 @@ def call_llm(prompt: str, system: str = None) -> str:
 def sleep_between_calls(seconds: float = RATE_LIMIT_SLEEP):
     time.sleep(seconds)
 
+
 if __name__ == "__main__":
     print("Testing call_llm()...")
     resp = call_llm("Reply with just: (a)")
     print(f"Raw response  : {resp!r}")
     print(f"Normalized    : {normalize_label(resp)}")
     print(f"Is correct (a): {is_correct(resp, '(a)')}")
+vnaruvan@VNS:/mnt/c/Users/vaaru/controlled_persistent_memory-backup/utils$
