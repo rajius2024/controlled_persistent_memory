@@ -9,7 +9,7 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
-from groq import Groq
+import requests
 
 from baselines.embeddings import embed_one
 from memory.schema import MemoryRecord, MemoryStatus
@@ -286,26 +286,27 @@ def compute_specificity_score(canonical_text: str, slot: str) -> float:
     return 1.0 - sim
 
 
-class GroqWriteGate:
+class LocalWriteGate:
     def __init__(
         self,
         model_name: str | None = None,
-        max_completion_tokens: int = 64,
+        max_completion_tokens: int = 96,
+        base_url: str | None = None,
         api_key: str | None = None,
     ):
         self.model_name = model_name or os.environ.get(
             "WRITE_GATE_MODEL",
-            "llama-3.3-70b-versatile",
+            "/scratch/vnaruvan/models/llama31_8b_instruct_pinned",
         )
-        print(f"[write_gate] loading model: {self.model_name}", flush=True)
-
-        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
-        if not resolved_key:
-            raise ValueError("GROQ_API_KEY is not set.")
-
-        self.client = Groq(api_key=resolved_key)
+        self.base_url = base_url or os.environ.get(
+            "WRITE_GATE_BASE_URL",
+            "http://127.0.0.1:8000/v1/chat/completions",
+        )
+        self.api_key = api_key or os.environ.get("WRITE_GATE_API_KEY", "local-token")
         self.max_completion_tokens = max_completion_tokens
         self.cache: dict[str, list[dict[str, Any]]] = {}
+
+        print(f"[write_gate] loading local model: {self.model_name}", flush=True)
 
     def _extract_json_text(self, text: str) -> str:
         text = text.strip()
@@ -320,18 +321,27 @@ class GroqWriteGate:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        completion = self.client.chat.completions.create(
-            model=self.model_name,
-            temperature=0,
-            response_format={"type": "json_object"},
-            max_completion_tokens=self.max_completion_tokens,
-            messages=[
-                {"role": "system", "content": WRITE_GATE_PROMPT},
-                {"role": "user", "content": utterance},
-            ],
+        resp = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model_name,
+                "messages": [
+                    {"role": "system", "content": WRITE_GATE_PROMPT},
+                    {"role": "user", "content": utterance},
+                ],
+                "temperature": 0.0,
+                "max_tokens": self.max_completion_tokens,
+            },
+            timeout=180,
         )
+        resp.raise_for_status()
+        data = resp.json()
 
-        raw = completion.choices[0].message.content.strip()
+        raw = data["choices"][0]["message"]["content"].strip()
         print(f"[write_gate][raw] {raw}", flush=True)
 
         try:
@@ -378,7 +388,7 @@ class GroqWriteGate:
                     "target_kind": target_kind,
                     "polarity": polarity,
                     "memory_type": memory_type,
-                    "extraction_reason": "groq_write_gate",
+                    "extraction_reason": "local_write_gate",
                     "update_hint": bool(item.get("update_hint", False)),
                     "confidence": 1.0,
                 }
@@ -388,13 +398,13 @@ class GroqWriteGate:
         return cleaned
 
 
-_GATE: GroqWriteGate | None = None
+_GATE: LocalWriteGate | None = None
 
 
-def _get_gate() -> GroqWriteGate:
+def _get_gate() -> LocalWriteGate:
     global _GATE
     if _GATE is None:
-        _GATE = GroqWriteGate()
+        _GATE = LocalWriteGate()
     return _GATE
 
 
