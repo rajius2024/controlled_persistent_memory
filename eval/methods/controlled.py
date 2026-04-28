@@ -303,6 +303,7 @@ class ControlledMethod:
             "musicRecommendation",
             "movieRecommendation",
             "provide_preference_aligned_recommendations",
+            "generalizing_to_new_scenarios",
         }:
             return "recommendation"
 
@@ -669,12 +670,23 @@ class ControlledMethod:
                     float(row.get("score", 0.0)),
                 )
 
+        best_scores = [float(row["best_score"]) for row in fused.values()]
+        if best_scores:
+            lo = min(best_scores)
+            hi = max(best_scores)
+        else:
+            lo = 0.0
+            hi = 0.0
+
         out = []
         for _, row in fused.items():
+            raw_best = float(row["best_score"])
+            norm_best = (raw_best - lo) / (hi - lo) if hi > lo else 0.0
+
             out.append(
                 {
                     "memory": row["memory"],
-                    "score": float(row["rrf_score"]) + 0.15 * float(row["best_score"]),
+                    "score": float(row["rrf_score"]) + 0.08 * norm_best,
                     "semantic_score": float(row["best_semantic_score"]),
                     "status": row["status"],
                     "polarity": row["polarity"],
@@ -825,7 +837,9 @@ class ControlledMethod:
                     filtered_superseded = slot_superseded
 
         effective_k = self.top_k
-        if focus_mode in {"timeline", "reason_update"}:
+        if focus_mode == "raw_recall":
+            effective_k = min(self.top_k, 4)
+        elif focus_mode in {"timeline", "reason_update"}:
             effective_k = max(self.top_k, 7)
 
         dense_active_rows = self._scored_candidates(
@@ -969,7 +983,7 @@ class ControlledMethod:
             )
 
         return retrieved_records, retrieved_scores, retrieval_debug
-    
+
     def _is_negative_memory(self, memory: MemoryRecord) -> bool:
         text = f"{memory.normalized_mem_text} {memory.metadata.get('provenance_text', '')}".lower()
         return any(marker in text for marker in NEGATIVE_MARKERS)
@@ -983,217 +997,95 @@ class ControlledMethod:
         return any(marker in text for marker in CAUSE_MARKERS)
 
     def _build_prompt(self, episode: dict[str, Any], retrieved_records: list[MemoryRecord]) -> str:
-            focus_mode = self._query_focus_mode(episode)
+        focus_mode = self._query_focus_mode(episode)
 
-            if retrieved_records:
-                memory_lines = []
+        if retrieved_records:
+            memory_lines = []
 
-                if focus_mode == "raw_recall":
-                    ordered = sorted(
-                        retrieved_records,
-                        key=lambda m: (-len(str(m.metadata.get("provenance_text", "")).strip()), m.memory_id),
-                )[:3]
+            if focus_mode == "raw_recall":
+                ordered = sorted(
+                    retrieved_records,
+                    key=lambda m: (-len(str(m.metadata.get("provenance_text", "")).strip()), m.memory_id),
+                )
+                for memory in ordered:
+                    canonical = memory.normalized_mem_text
+                    provenance = str(memory.metadata.get("provenance_text", "")).strip()
+                    status = str(memory.status)
 
-                    memory_lines.append("Relevant factual memories:")
-                    for memory in ordered:
-                        canonical = memory.normalized_mem_text
-                        provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                        status = str(memory.status)
+                    block = []
+                    if provenance:
+                        block.append(f"- Evidence: {provenance}")
+                    block.append(f"  Memory summary: {canonical}")
+                    block.append(f"  Status: {status}")
+                    memory_lines.append("\n".join(block))
 
-                        block = []
-                        if provenance:
-                            block.append(f"- Evidence: {provenance}")
-                        block.append(f"  Memory summary: {canonical}")
-                        block.append(f"  Status: {status}")
-                        memory_lines.append("\n".join(block))
+            elif focus_mode in {"timeline", "reason_update"}:
+                active_rows = []
+                older_rows = []
+                other_rows = []
 
-                    memory_lines.append(
-                        "\nInstruction: Answer from the most direct factual memory. "
-                        "Do not overuse broad background memories."
-                    )
+                for memory in retrieved_records:
+                    status = str(memory.status).lower()
+                    if "superseded" in status or bool(memory.metadata.get("update_hint", False)):
+                        older_rows.append(memory)
+                    elif "active" in status:
+                        active_rows.append(memory)
+                    else:
+                        other_rows.append(memory)
 
-                elif focus_mode == "timeline":
-                    active_rows = []
-                    older_rows = []
-                    other_rows = []
+                ordered = active_rows + older_rows + other_rows
 
-                    for memory in retrieved_records:
-                        status = str(memory.status).lower()
-                        if "superseded" in status or bool(memory.metadata.get("update_hint", False)):
-                            older_rows.append(memory)
-                        elif "active" in status:
-                            active_rows.append(memory)
-                        else:
-                            other_rows.append(memory)
+                for memory in ordered:
+                    canonical = memory.normalized_mem_text
+                    provenance = str(memory.metadata.get("provenance_text", "")).strip()
+                    status = str(memory.status)
 
-                    memory_lines.append("Relevant memory timeline:")
+                    if "superseded" in status.lower() or bool(memory.metadata.get("update_hint", False)):
+                        label = "Older state / change evidence"
+                    else:
+                        label = "Current state"
 
-                    if older_rows:
-                        memory_lines.append("\nOlder or superseded memories:")
-                        for memory in older_rows[:3]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
+                    block = [f"- {label}: {canonical}", f"  Status: {status}"]
+                    if provenance:
+                        block.append(f"  Evidence: {provenance}")
+                    memory_lines.append("\n".join(block))
 
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    if active_rows:
-                        memory_lines.append("\nCurrent active memories:")
-                        for memory in active_rows[:5]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
-
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    if other_rows:
-                        memory_lines.append("\nOther relevant memories:")
-                        for memory in other_rows[:2]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
-
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    memory_lines.append(
-                        "\nInstruction: Use active memories as the user's current state. "
-                        "Use older or superseded memories only to understand how the preference changed over time."
-                    )
-
-                elif focus_mode == "reason_update":
-                    causal_rows = []
-                    other_rows = []
-
-                    for memory in retrieved_records:
-                        if self._has_causal_signal(memory) or self._is_negative_memory(memory):
-                            causal_rows.append(memory)
-                        else:
-                            other_rows.append(memory)
-
-                    ordered = causal_rows[:6] + other_rows[:2]
-
-                    memory_lines.append("Relevant causal evidence:")
-                    for memory in ordered:
-                        canonical = memory.normalized_mem_text
-                        provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                        status = str(memory.status)
-
-                        block = [f"- Memory summary: {canonical}", f"  Status: {status}"]
-                        if provenance:
-                            block.insert(0, f"- Evidence: {provenance}")
-                        memory_lines.append("\n".join(block))
-
-                    memory_lines.append(
-                        "\nInstruction: Prioritize explicit reasons such as because, led to, stressful, conflict, "
-                        "arguments, overwhelming, emotionally draining, or similar causal evidence."
-                    )
-
-                elif focus_mode in {"recommendation", "idea_generation"}:
-                    likes = []
-                    avoids = []
-                    neutral = []
-
-                    for memory in retrieved_records:
-                        if self._is_negative_memory(memory):
-                            avoids.append(memory)
-                        elif self._is_positive_memory(memory):
-                            likes.append(memory)
-                        else:
-                            neutral.append(memory)
-
-                    memory_lines.append("Relevant preference evidence:")
-
-                    if likes:
-                        memory_lines.append("\nLikes / preferences to support:")
-                        for memory in likes[:5]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
-
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    if avoids:
-                        memory_lines.append("\nAvoid / dislike constraints:")
-                        for memory in avoids[:4]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
-
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    if neutral:
-                        memory_lines.append("\nOther context:")
-                        for memory in neutral[:2]:
-                            canonical = memory.normalized_mem_text
-                            provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                            status = str(memory.status)
-
-                            block = [f"- {canonical}", f"  Status: {status}"]
-                            if provenance:
-                                block.append(f"  Evidence: {provenance}")
-                            memory_lines.append("\n".join(block))
-
-                    memory_lines.append(
-                        "\nInstruction: Use likes/preferences as positive evidence. "
-                        "Use avoid/dislike constraints only to eliminate bad options. "
-                        "Do not choose an option similar to something the user disliked, stopped, gave up, "
-                        "discontinued, canceled, or found stressful."
-                    )
-
-                else:
-                    evidence_rich = [
-                        memory for memory in retrieved_records
-                        if str(memory.metadata.get("provenance_text", "")).strip()
-                    ]
-                    evidence_poor = [
-                        memory for memory in retrieved_records
-                        if not str(memory.metadata.get("provenance_text", "")).strip()
-                    ]
-                    ordered = evidence_rich + evidence_poor
-
-                    memory_lines.append("Relevant memories:")
-                    for memory in ordered[:5]:
-                        canonical = memory.normalized_mem_text
-                        provenance = str(memory.metadata.get("provenance_text", "")).strip()
-                        status = str(memory.status)
-
-                        block = [f"- Memory: {canonical}", f"  Status: {status}"]
-                        if provenance:
-                            block.append(f"  Evidence: {provenance}")
-                        memory_lines.append("\n".join(block))
-
-                memories_block = "\n".join(memory_lines)
             else:
-                memories_block = "None"
+                evidence_rich = [
+                    memory for memory in retrieved_records
+                    if str(memory.metadata.get("provenance_text", "")).strip()
+                ]
+                evidence_poor = [
+                    memory for memory in retrieved_records
+                    if not str(memory.metadata.get("provenance_text", "")).strip()
+                ]
+                ordered = evidence_rich + evidence_poor
 
-            question = episode.get("question", "") or ""
-            options = episode.get("options", "") or ""
+                for memory in ordered:
+                    canonical = memory.normalized_mem_text
+                    provenance = str(memory.metadata.get("provenance_text", "")).strip()
+                    status = str(memory.status)
 
-            return (
-                "You are answering a multiple-choice question about a user.\n\n"
-                "Use the retrieved memories and evidence carefully.\n"
-                "The memory section may be organized by question type.\n\n"
-                "For evolution questions, distinguish current active preferences from older or superseded preferences.\n"
-                "For recommendation or suggestion questions, use likes/preferences as support and avoid/dislike memories as constraints.\n"
-                "For reason questions, prioritize explicit causal evidence.\n"
-                "For recall questions, prefer the most direct factual memory over broad background context.\n\n"
-                f"Retrieved memories:\n{memories_block}\n\n"
-                f"Question: {question}\n"
-                f"Options:\n{options}\n\n"
-                "Return EXACTLY one of: (a) (b) (c) (d). No other text."
-            )
+                    block = [f"- Memory: {canonical}", f"  Status: {status}"]
+                    if provenance:
+                        block.append(f"  Evidence: {provenance}")
+                    memory_lines.append("\n".join(block))
+
+            memories_block = "\n".join(memory_lines)
+        else:
+            memories_block = "None"
+
+        question = episode.get("question", "") or ""
+        options = episode.get("options", "") or ""
+
+        return (
+            "You are answering a multiple-choice question about a user.\n\n"
+            "Use the retrieved memories and evidence carefully.\n"
+            "Prefer ACTIVE memories as the user's current state.\n"
+            "Use older or superseded evidence only when the question asks about change over time, "
+            "reasons for updates, or preference evolution.\n\n"
+            f"Retrieved memories:\n{memories_block}\n\n"
+            f"Question: {question}\n"
+            f"Options:\n{options}\n\n"
+            "Return EXACTLY one of: (a) (b) (c) (d). No other text."
+        )
