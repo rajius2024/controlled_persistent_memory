@@ -19,6 +19,7 @@ def build_episodes(num_to_build=None):
     output_file = os.path.join(BASE_DIR, "dev_latest.jsonl")
     
     with open(output_file, "w", encoding='utf-8') as f:
+        actual_count = 0
         for i in range(limit):
             row = questions_df.iloc[i]
             
@@ -39,7 +40,6 @@ def build_episodes(num_to_build=None):
                 content = turn.get("content", "")
                 
                 # --- Prefix Cleaning ---
-                # Removes "User: ", "Assistant: ", etc. if they are inside the text
                 prefixes = [f"{role}: ", f"{role.lower()}: ", "System: ", "system: "]
                 clean_text = content
                 for p in prefixes:
@@ -49,50 +49,34 @@ def build_episodes(num_to_build=None):
                 
                 clean_text = clean_text.strip()
                 
-                # A. Add to Structured List (For Teammates)
+                # A. Add to Structured List
                 structured_turns.append({
                     "turn_index": idx,
                     "role": role.lower(),
                     "content": clean_text
                 })
 
-                # B. Add to Formatted String (For Gemini)
+                # B. Add to Formatted String
                 formatted_string += f"{role}: {clean_text}\n"
-            
-            # # 3. NOW format the sliced list into a string for the AI
-            # formatted_context = ""
-            # for turn in sliced_history_list:
-            #     role = turn.get("role", "Unknown").capitalize()
-            #     text = turn.get("content", "")
-                
-            #     # We check if the dataset accidentally included "User: " in the text.
-            #     expected_prefix = f"{role}: "
-                
-            #     if text.startswith(expected_prefix):
-            #         # If it did, we chop the duplicate off. 
-            #         text = text[len(expected_prefix):]
-                
-            #     # Now, we safely apply our OWN perfectly uniform label.
-            #     formatted_context += f"{role}: {text}\n"
+
+            # --- LEAKAGE SAFETY GATE ---
+            # If the question is already in the context, skip this episode.
+            question_text = str(row.get("user_question_or_message")).lower().strip()
+            if question_text in formatted_string.lower():
+                print(f"⚠️ Skipping Episode {i}: Leakage detected.")
+                continue 
             
             # --- The 100% Complete Dictionary ---
             episode = {
-                # 1. Identifiers & Tracking
                 "episode_id": int(i),
                 "persona_id": str(row.get("persona_id")),
                 "question_id": str(row.get("question_id")),
                 "shared_context_id": ctx_id,
-                
-                # 2. What the AI needs to read
                 "question": str(row.get("user_question_or_message")),
                 "options": str(row.get("all_options")), 
                 "answer": str(row.get("correct_answer")),
-
-                # The Memory (Two formats)
-                "sliced_context": formatted_string.strip(), # Labeled blob for AI
+                "sliced_context": formatted_string.strip(), 
                 "turns": structured_turns,               
-                
-                # 4. ALL Metadata for your final analysis
                 "question_type": str(row.get("question_type")),
                 "topic": str(row.get("topic")),
                 "context_length_in_tokens": int(row.get("context_length_in_tokens", 0)),
@@ -105,8 +89,9 @@ def build_episodes(num_to_build=None):
             }
             
             f.write(json.dumps(episode) + "\n")
+            actual_count += 1
             
-    print(f"Success: Created {limit} episodes in 'dev_latest.jsonl' ")
+    print(f"Success: Created {actual_count} clean episodes in 'dev_latest.jsonl' (Skipped {limit - actual_count} leaks)")
 
 if __name__ == "__main__":
-    build_episodes(100)
+    build_episodes(589)
