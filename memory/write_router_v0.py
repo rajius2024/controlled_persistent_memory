@@ -6,6 +6,7 @@ import os
 import re
 import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,11 +31,18 @@ Return ONLY JSON:
    "update_hint":false}
 ]}
 
-Return at most 1 item unless the utterance clearly contains 2 distinct durable memories.
+Rules:
+- Return at most 2 items.
+- Only extract durable user-specific information.
+- Prefer the MOST SPECIFIC durable memory over broad category labels.
+- Do not write generic summaries when a more specific durable target is present.
+- If the utterance implies both an old state and a new stable state, emit both only if both are durable and distinct.
+- Keep canonical_memory short, normalized, and retrieval-friendly.
+- Do not include explanations.
 
-Set update_hint=true ONLY when the utterance explicitly signals a change from a prior state.
+Set update_hint=true ONLY when the utterance explicitly signals change from an earlier state.
 
-Required signals include phrases like:
+Required update signals include:
 - "used to"
 - "no longer"
 - "lost interest"
@@ -45,18 +53,18 @@ Required signals include phrases like:
 - "realized I no longer"
 
 Do NOT set update_hint=true for:
-- new information stated for the first time
-- preferences or values introduced without contrast to a prior state
-- general reflections, observations, or opinions
-- broad self-description without an explicit change signal
+- first-time information
+- broad identity statements without change
+- vague reflection
+- ordinary preference statements without contrast
 
-Extract ALL distinct durable preference or profile signals from the utterance.
-A single utterance may contain multiple memories.
-Do not merge different preferences into one item.
-Commonly missed: a negative update and a positive anchor in the same utterance.
+Specificity rule:
+- Prefer "likes producing electronic music" over "likes music"
+- Prefer "likes literary fiction" over "likes books"
+- Prefer "prefers texting over calling" over "has communication preferences"
 
 Examples:
-"likes producing music"
+"likes producing electronic music"
 "dislikes mushrooms"
 "prefers texting over calling"
 "usually works late"
@@ -178,6 +186,64 @@ def _is_valid_canonical_memory(text: str) -> bool:
     return True
 
 
+def _target_tokens(text: str) -> set[str]:
+    lowered = text.strip().lower()
+    prefixes = [
+        "likes ",
+        "dislikes ",
+        "prefers ",
+        "usually ",
+        "is ",
+        "interested in ",
+    ]
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            lowered = lowered[len(prefix):].strip()
+            break
+    return {tok for tok in re.findall(r"[a-z0-9]+", lowered) if tok}
+
+
+def _is_generic_shadowed(
+    candidate: dict[str, Any],
+    others: list[dict[str, Any]],
+) -> bool:
+    cand_tokens = _target_tokens(candidate["normalized_text"])
+    if not cand_tokens:
+        return False
+
+    for other in others:
+        if other is candidate:
+            continue
+        if candidate["slot"] != other["slot"]:
+            continue
+        if candidate["target_kind"] != other["target_kind"]:
+            continue
+        if candidate["polarity"] != other["polarity"]:
+            continue
+
+        other_tokens = _target_tokens(other["normalized_text"])
+        if not other_tokens:
+            continue
+
+        if cand_tokens.issubset(other_tokens) and len(cand_tokens) < len(other_tokens):
+            return True
+
+    return False
+
+
+def _drop_generic_shadowed(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for item in items:
+        if _is_generic_shadowed(item, items):
+            print(
+                f"[write_gate][drop] generic_shadowed normalized={item['normalized_text']!r}",
+                flush=True,
+            )
+            continue
+        out.append(item)
+    return out
+
+
 def should_store_turn(turn: dict[str, Any]) -> bool:
     if turn.get("role") != "user":
         return False
@@ -290,7 +356,7 @@ class GroqWriteGate:
     def __init__(
         self,
         model_name: str | None = None,
-        max_completion_tokens: int = 64,
+        max_completion_tokens: int = 96,
         api_key: str | None = None,
     ):
         self.model_name = model_name or os.environ.get(
@@ -307,6 +373,36 @@ class GroqWriteGate:
         self.max_completion_tokens = max_completion_tokens
         self.cache: dict[str, list[dict[str, Any]]] = {}
 
+        cache_root = os.environ.get("WRITE_GATE_CACHE_DIR", "cache/write_gate")
+        self.cache_dir = Path(cache_root)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[write_gate] disk cache dir: {self.cache_dir}", flush=True)
+
+    def _cache_file(self, cache_key: str) -> Path:
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{digest}.json"
+
+    def _load_disk_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
+        path = self._cache_file(cache_key)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_disk_cache(self, cache_key: str, value: list[dict[str, Any]]) -> None:
+        path = self._cache_file(cache_key)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(value, f, ensure_ascii=False)
+            tmp_path.replace(path)
+        except Exception:
+            pass
+
     def _extract_json_text(self, text: str) -> str:
         text = text.strip()
         start = text.find("{")
@@ -316,34 +412,58 @@ class GroqWriteGate:
         return text[start : end + 1]
 
     def extract_candidates(self, utterance: str) -> list[dict[str, Any]]:
-        cache_key = f"{self.model_name}||{self.max_completion_tokens}||{utterance.strip()}"
+        cache_key = (
+            f"model={self.model_name}"
+            f"||max_tokens={self.max_completion_tokens}"
+            f"||prompt_v=write_gate_v6_groq_specificity"
+            f"||utterance={utterance.strip()}"
+        )
+
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        completion = self.client.chat.completions.create(
-            model=self.model_name,
-            temperature=0,
-            response_format={"type": "json_object"},
-            max_completion_tokens=self.max_completion_tokens,
-            messages=[
-                {"role": "system", "content": WRITE_GATE_PROMPT},
-                {"role": "user", "content": utterance},
-            ],
-        )
+        disk_cached = self._load_disk_cache(cache_key)
+        if disk_cached is not None:
+            self.cache[cache_key] = disk_cached
+            return disk_cached
 
-        raw = completion.choices[0].message.content.strip()
-        print(f"[write_gate][raw] {raw}", flush=True)
+        last_err = None
+        for attempt in range(3):
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model_name,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    max_completion_tokens=self.max_completion_tokens,
+                    messages=[
+                        {"role": "system", "content": WRITE_GATE_PROMPT},
+                        {"role": "user", "content": utterance},
+                    ],
+                )
+                raw = completion.choices[0].message.content.strip()
+                print(f"[write_gate][raw] {raw}", flush=True)
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0 * (attempt + 1))
+        else:
+            print(f"[write_gate][error] {last_err}", flush=True)
+            self.cache[cache_key] = []
+            self._save_disk_cache(cache_key, [])
+            return []
 
         try:
             raw_json = self._extract_json_text(raw)
             parsed = json.loads(raw_json)
         except Exception:
             self.cache[cache_key] = []
+            self._save_disk_cache(cache_key, [])
             return []
 
         items = parsed.get("items", [])
         if not isinstance(items, list):
             self.cache[cache_key] = []
+            self._save_disk_cache(cache_key, [])
             return []
 
         cleaned: list[dict[str, Any]] = []
@@ -384,7 +504,10 @@ class GroqWriteGate:
                 }
             )
 
+        cleaned = _drop_generic_shadowed(cleaned)
+
         self.cache[cache_key] = cleaned
+        self._save_disk_cache(cache_key, cleaned)
         return cleaned
 
 
@@ -417,7 +540,7 @@ def _build_memory_record(
         metadata={
             "source_utterance": source_text,
             "provenance_text": source_text[:300],
-            "router_version": "write_gate_v5_groq_specificity",
+            "router_version": "write_gate_v6_groq_specificity",
             "source_turn_index": turn_index,
             "slot": candidate["slot"],
             "polarity": candidate["polarity"],
@@ -476,3 +599,4 @@ def extract_memories_from_episode(episode: dict[str, Any]) -> list[MemoryRecord]
     for turn in turns:
         memories.extend(extract_memories_from_turn(turn, persona_id))
     return memories
+

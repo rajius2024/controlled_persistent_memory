@@ -5,3 +5,10 @@ __pycache__/
 runs/
 tmp/
 *.log
+
+# Generated evaluation artifacts
+results/
+data/dev_latest.jsonl
+*.log
+*.err
+*.out
