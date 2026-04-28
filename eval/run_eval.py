@@ -42,6 +42,48 @@ class NoMemoryMethod:
         return pred, raw_text, [], [], 0, 0
 
 
+class SummaryOnlyMethod:
+    """
+    Summary-only baseline using shared utils.llm call_llm().
+
+    Uses a compressed summary field if available.
+    If no summary field exists, falls back to sliced_context so the run does not crash.
+    """
+
+    def __init__(self, k: int = 15, token_cap: int = 8000, options_cap_chars: int = 2500):
+        self.k = k
+        self.token_cap = token_cap
+        self.options_cap_chars = options_cap_chars
+
+    def answer(self, ep: dict):
+        summary = (
+            ep.get("summary", "")
+            or ep.get("summary_context", "")
+            or ep.get("conversation_summary", "")
+            or ep.get("sliced_context", "")
+            or ""
+        )
+
+        summary = summary[-self.token_cap:]
+        options = (ep.get("options", "") or "")[:self.options_cap_chars]
+        question = ep.get("question", "") or ""
+
+        prompt = (
+            f"Conversation summary:\n{summary}\n\n"
+            f"Question: {question}\n"
+            f"Options:\n{options}\n\n"
+            f"Output format must be EXACTLY one of: (a) (b) (c) (d). No other text."
+        )
+
+        raw_text = call_llm(prompt)
+        pred = normalize_label(raw_text)
+
+        stored_count = 1 if summary else 0
+        superseded_count = 0
+
+        return pred, raw_text, [], [], stored_count, superseded_count
+
+
 class VanillaRAGMethod:
     """
     Vanilla RAG baseline wrapper that reuses the shared retrieval pipeline.
@@ -85,11 +127,12 @@ def build_output_path(method_name: str, out_dir: str, episodes_path: str) -> str
     dataset_stem = os.path.splitext(os.path.basename(episodes_path))[0]
     return os.path.join(out_dir, f"{method_name}_{dataset_stem}.jsonl")
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        choices=["no_memory", "vanilla_rag", "controlled"],
+        choices=["no_memory", "summary_only", "vanilla_rag", "controlled"],
         required=True,
         help="Method to run",
     )
@@ -117,28 +160,58 @@ def main():
         default=os.path.join("data", "dev_latest.jsonl"),
         help="Path to episode dataset jsonl",
     )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Start index in the episode file (0-based)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of episodes to run after offset",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Explicit output jsonl path. Overrides out_dir-based default.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     if args.method == "no_memory":
         method = NoMemoryMethod(k=args.k, token_cap=args.token_cap)
+    elif args.method == "summary_only":
+        method = SummaryOnlyMethod(k=args.k, token_cap=args.token_cap)
     elif args.method == "vanilla_rag":
         method = VanillaRAGMethod(k=args.k, token_cap=args.token_cap)
     else:
         from eval.methods.controlled import ControlledMethod
+
         method = ControlledMethod(
             run_root=os.path.join(args.out_dir, "controlled_runs"),
             top_k=args.k,
         )
 
-    out_path = build_output_path(args.method, args.out_dir, args.episodes_path)
+    out_path = args.output or build_output_path(args.method, args.out_dir, args.episodes_path)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     correct = 0
     total = 0
 
     with open(out_path, "w", encoding="utf-8") as out:
-        for ep in iter_jsonl(args.episodes_path):
+        processed = 0
+
+        for idx, ep in enumerate(iter_jsonl(args.episodes_path)):
+            if idx < args.offset:
+                continue
+
+            if args.limit is not None and processed >= args.limit:
+                break
+
             start = time.time()
             (
                 pred,
@@ -149,17 +222,29 @@ def main():
                 superseded_count,
             ) = method.answer(ep)
             elapsed = time.time() - start
-            print(f"[eval] episode {ep.get('episode_id')} took {elapsed:.2f}s", flush=True)
+
+            print(
+                f"[eval] file_idx={idx} local_idx={processed} episode {ep.get('episode_id')} took {elapsed:.2f}s",
+                flush=True,
+            )
 
             gold = normalize_label(ep.get("answer", ""))
             correct_flag = is_correct(pred, gold)
             correct += int(correct_flag)
             total += 1
+            processed += 1
 
             contradiction_count = 0
 
             if args.method == "vanilla_rag":
                 stored_count = len(ep.get("turns", []))
+            elif args.method == "summary_only":
+                stored_count = 1 if (
+                    ep.get("summary", "")
+                    or ep.get("summary_context", "")
+                    or ep.get("conversation_summary", "")
+                    or ep.get("sliced_context", "")
+                ) else 0
             elif args.method == "controlled" and getattr(method, "last_trace", None):
                 stored_count = method.last_trace.get("stored_memories_count", stored_count)
                 superseded_count = method.last_trace.get("superseded_count", superseded_count)
@@ -177,6 +262,11 @@ def main():
                 "gold_raw": ep.get("answer", ""),
                 "gold": gold,
                 "correct": correct_flag,
+
+                # Slice bookkeeping
+                "file_index": idx,
+                "offset": args.offset,
+                "limit": args.limit,
 
                 # Retrieval / memory logs
                 "retrieved": retrieved_texts,
@@ -203,6 +293,11 @@ def main():
             }
 
             out.write(json.dumps(record) + "\n")
+
+        print(
+            f"Processed {total} episodes from offset={args.offset} limit={args.limit}",
+            flush=True,
+        )
 
     acc = correct / total if total else 0.0
     print(f"Accuracy: {correct}/{total} = {acc:.3f}")
