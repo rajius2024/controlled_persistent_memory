@@ -6,7 +6,6 @@ import time
 
 from utils.llm import call_llm, normalize_label, is_correct
 
-
 def iter_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
