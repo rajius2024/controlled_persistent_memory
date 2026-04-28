@@ -104,6 +104,7 @@ VALID_MEMORY_TYPES = {
     "profile_fact",
     "habit_or_routine",
     "general_preference",
+    "episodic_fact",
 }
 
 VALID_POLARITIES = {
@@ -331,6 +332,221 @@ def _default_memory_type(slot: str, target_kind: str) -> str:
         return "habit_or_routine"
     return "general_preference"
 
+def _has_first_person_signal(text: str) -> bool:
+    padded = f" {text.lower()} "
+    first_person_markers = [
+        " i ",
+        " i'm ",
+        " i’m ",
+        " i am ",
+        " i was ",
+        " i've ",
+        " i’ve ",
+        " i'd ",
+        " i’d ",
+        " my ",
+        " me ",
+        " mine ",
+        " we ",
+        " our ",
+        " us ",
+    ]
+    return any(marker in padded for marker in first_person_markers)
+
+
+def _infer_episodic_slot(text: str) -> str:
+    lowered = text.lower()
+
+    if any(token in lowered for token in [
+        "music", "song", "playlist", "album", "artist", "soundtrack",
+        "film score", "orchestra", "instrument", "jazz", "rock", "pop",
+    ]):
+        return "music"
+
+    if any(token in lowered for token in [
+        "book", "novel", "reading", "literature", "author", "library",
+        "fiction", "nonfiction", "poetry",
+    ]):
+        return "books"
+
+    if any(token in lowered for token in [
+        "coffee", "tea", "juice", "drink", "soda", "latte",
+    ]):
+        return "drink"
+
+    if any(token in lowered for token in [
+        "food", "pizza", "pasta", "breakfast", "dinner", "recipe",
+        "cooking", "baking", "cuisine",
+    ]):
+        return "food"
+
+    if any(token in lowered for token in [
+        "text", "call", "phone", "email", "message",
+    ]):
+        return "communication"
+
+    if any(token in lowered for token in [
+        "morning", "night", "weekend", "weekday", "schedule",
+    ]):
+        return "schedule"
+
+    if any(token in lowered for token in [
+        "family", "kids", "children", "parents", "partner", "friend",
+        "friends", "coworker", "team",
+    ]):
+        return "profile"
+
+    return "general"
+
+
+def _looks_like_episodic_fact(text: str) -> bool:
+    """
+    Identify concrete user-shared facts worth preserving for exact recall.
+
+    This is deliberately selective. It should not store every user turn.
+    """
+    lowered = text.lower()
+
+    if len(lowered) < 35:
+        return False
+
+    if not _has_first_person_signal(lowered):
+        return False
+
+    transient_only = [
+        "how are you",
+        "what do you think",
+        "can you help",
+        "please explain",
+        "i need help",
+    ]
+    if any(phrase in lowered for phrase in transient_only):
+        return False
+
+    concrete_markers = [
+        "attended",
+        "visited",
+        "went to",
+        "saw",
+        "watched",
+        "read",
+        "finished",
+        "started",
+        "created",
+        "introduced",
+        "reintroduced",
+        "planned",
+        "organized",
+        "joined",
+        "volunteered",
+        "tried",
+        "made",
+        "cooked",
+        "baked",
+        "built",
+        "learned",
+        "discovered",
+        "realized",
+        "decided",
+        "stopped",
+        "discontinued",
+        "gave up",
+        "replaced",
+        "switched",
+        "my kids",
+        "my family",
+        "our family",
+        "my friend",
+        "my partner",
+        "favorite",
+        "workshop",
+        "class",
+        "club",
+        "project",
+        "challenge",
+        "tradition",
+        "trip",
+        "event",
+        "movie",
+        "film",
+        "book",
+        "recipe",
+        "restaurant",
+        "museum",
+        "park",
+        "beach",
+        "lake",
+        "trail",
+    ]
+
+    if not any(marker in lowered for marker in concrete_markers):
+        return False
+
+    # Avoid storing very generic preference-only utterances as episodic facts.
+    generic_preference_only = [
+        r"^i like [a-z\s]{1,30}$",
+        r"^i love [a-z\s]{1,30}$",
+        r"^i prefer [a-z\s]{1,30}$",
+        r"^i dislike [a-z\s]{1,30}$",
+    ]
+    if any(re.match(pattern, lowered.strip()) for pattern in generic_preference_only):
+        return False
+
+    return True
+
+
+def _normalize_episodic_fact(text: str) -> str:
+    """
+    Preserve concrete details while keeping the memory compact.
+    """
+    text = _clean_text(text)
+    text = text.strip(" .,!?:;\"'")
+
+    # Keep more detail than preference canonicalization.
+    if len(text) > 260:
+        text = text[:260].rsplit(" ", 1)[0]
+
+    lowered = text.lower()
+
+    if lowered.startswith(("i ", "we ", "my ", "our ")):
+        return text
+
+    return text
+
+
+def _build_episodic_fact_candidate(source_text: str) -> dict[str, Any] | None:
+    if not _looks_like_episodic_fact(source_text):
+        return None
+
+    normalized = _normalize_episodic_fact(source_text)
+    if len(normalized.split()) < 5:
+        return None
+
+    slot = _infer_episodic_slot(normalized)
+
+    return {
+        "normalized_text": normalized,
+        "slot": slot,
+        "target_kind": "episodic_fact",
+        "polarity": "neutral",
+        "memory_type": "episodic_fact",
+        "extraction_reason": "episodic_fact_rule",
+        "update_hint": any(
+            marker in normalized.lower()
+            for marker in [
+                "used to",
+                "no longer",
+                "not anymore",
+                "stopped",
+                "discontinued",
+                "gave up",
+                "replaced",
+                "switched",
+                "realized",
+            ]
+        ),
+        "confidence": 0.85,
+    }
 
 @lru_cache(maxsize=32)
 def _slot_anchor_vec(slot: str) -> tuple[float, ...]:
@@ -557,21 +773,35 @@ def _build_memory_record(
 
 
 def extract_memories_from_turn(turn: dict[str, Any], persona_id: str) -> list[MemoryRecord]:
-    if not should_store_turn(turn):
+    if turn.get("role") != "user":
         return []
 
     content = _clean_text(turn.get("content", ""))
-    content = content[:450]
-    if not content:
+    content = content[:700]
+    if not content or len(content) <= 20:
         return []
 
     turn_index = int(turn.get("turn_index", 0))
-    gate = _get_gate()
 
-    start = time.perf_counter()
-    candidates = gate.extract_candidates(content)
-    elapsed = time.perf_counter() - start
-    print(f"[write_gate] persona={persona_id} turn={turn_index} took {elapsed:.2f}s", flush=True)
+    candidates: list[dict[str, Any]] = []
+
+    # Existing controlled preference/profile extraction.
+    if should_store_turn(turn):
+        gate = _get_gate()
+
+        start = time.perf_counter()
+        candidates.extend(gate.extract_candidates(content[:450]))
+        elapsed = time.perf_counter() - start
+        print(f"[write_gate] persona={persona_id} turn={turn_index} took {elapsed:.2f}s", flush=True)
+
+    # New controlled episodic fact extraction.
+    # This is selective and rule-based, not store-all raw RAG.
+    episodic_candidate = _build_episodic_fact_candidate(content)
+    if episodic_candidate is not None:
+        candidates.append(episodic_candidate)
+
+    if not candidates:
+        return []
 
     records: list[MemoryRecord] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -585,11 +815,11 @@ def extract_memories_from_turn(turn: dict[str, Any], persona_id: str) -> list[Me
         )
         if key in seen:
             continue
+
         seen.add(key)
         records.append(_build_memory_record(persona_id, turn_index, content, candidate))
 
     return records
-
 
 def extract_memories_from_episode(episode: dict[str, Any]) -> list[MemoryRecord]:
     persona_id = str(episode["persona_id"])

@@ -121,8 +121,10 @@ def _single_value_slot(record: MemoryRecord) -> bool:
 
 
 def memories_conflict(existing: MemoryRecord, new: MemoryRecord) -> bool:
-    if not _same_persona(existing, new):
+    if existing.memory_type == "episodic_fact" or new.memory_type == "episodic_fact":
         return False
+    if not _same_persona(existing, new):
+        return False    
     if _status_value(existing.status) != MemoryStatus.ACTIVE.value:
         return False
     if not _same_slot(existing, new):
