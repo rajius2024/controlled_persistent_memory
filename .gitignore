@@ -7,7 +7,7 @@ tmp/
 *.log
 
 # Generated evaluation artifacts
-results/
+results/controlled_runs/
 data/dev_latest.jsonl
 *.log
 *.err
