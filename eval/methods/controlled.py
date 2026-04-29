@@ -522,6 +522,26 @@ class ControlledMethod:
             if any(tok in provenance for tok in ["started", "planned", "introduced", "created", "challenge", "tradition"]):
                 score += 0.06
 
+
+        # Question-type gated episodic scoring.
+        if memory.memory_type == "episodic_fact":
+            if focus_mode == "raw_recall":
+                pass
+            elif focus_mode == "reason_update":
+                if self._has_causal_signal(memory) or bool(memory.metadata.get("update_hint", False)):
+                    score += 0.10
+                else:
+                    score -= 0.04
+            elif focus_mode == "timeline":
+                if self._has_causal_signal(memory) or bool(memory.metadata.get("update_hint", False)):
+                    score += 0.06
+                else:
+                    score -= 0.08
+            elif focus_mode in {"recommendation", "idea_generation"}:
+                score -= 0.15
+            else:
+                score -= 0.05
+
         return score
 
     def _bm25_retrieve(
@@ -813,6 +833,82 @@ class ControlledMethod:
 
         return chosen_rows
 
+
+    def _apply_typed_episodic_gate(
+        self,
+        rows: list[dict[str, Any]],
+        focus_mode: str,
+        effective_k: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Keep compact preference/state memories as the default representation.
+        Use episodic facts primarily for exact recall and lightly for causal/update tasks.
+        """
+        if not rows:
+            return rows
+
+        episodic_rows = [
+            row for row in rows
+            if row["memory"].memory_type == "episodic_fact"
+        ]
+        preference_rows = [
+            row for row in rows
+            if row["memory"].memory_type != "episodic_fact"
+        ]
+        causal_episodic_rows = [
+            row for row in episodic_rows
+            if self._has_causal_signal(row["memory"])
+            or bool(row["memory"].metadata.get("update_hint", False))
+        ]
+
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add_many(candidates: list[dict[str, Any]], limit: int | None = None) -> None:
+            added = 0
+            for row in candidates:
+                mem_id = row["memory"].memory_id
+                if mem_id in seen:
+                    continue
+                selected.append(row)
+                seen.add(mem_id)
+                added += 1
+
+                if len(selected) >= effective_k:
+                    return
+                if limit is not None and added >= limit:
+                    return
+
+        if focus_mode == "raw_recall":
+            add_many(episodic_rows, limit=3)
+            add_many(preference_rows)
+
+        elif focus_mode == "reason_update":
+            add_many(preference_rows, limit=max(effective_k - 2, 0))
+            add_many(causal_episodic_rows, limit=2)
+            add_many(preference_rows)
+            add_many(episodic_rows, limit=1)
+
+        elif focus_mode == "timeline":
+            add_many(preference_rows, limit=max(effective_k - 1, 0))
+            add_many(causal_episodic_rows, limit=1)
+            add_many(preference_rows)
+
+        elif focus_mode in {"recommendation", "idea_generation"}:
+            add_many(preference_rows)
+            if len(selected) < effective_k:
+                add_many(causal_episodic_rows, limit=1)
+
+        else:
+            add_many(preference_rows)
+            if len(selected) < effective_k:
+                add_many(causal_episodic_rows, limit=1)
+
+        if len(selected) < min(effective_k, len(rows)):
+            add_many(rows)
+
+        return selected[:effective_k]
+
     def _retrieve_top_k(
         self,
         episode: dict[str, Any],
@@ -988,6 +1084,12 @@ class ControlledMethod:
                 chosen_rows = (episodic_rows + other_rows)[:effective_k]
             else:
                 chosen_rows = self._select_diverse_slate(merged, effective_k)
+
+        chosen_rows = self._apply_typed_episodic_gate(
+            chosen_rows,
+            focus_mode=focus_mode,
+            effective_k=effective_k,
+        )
 
         retrieved_records = [row["memory"] for row in chosen_rows]
         retrieved_scores = [float(row["score"]) for row in chosen_rows]
