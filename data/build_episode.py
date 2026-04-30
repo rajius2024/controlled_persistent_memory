@@ -94,4 +94,4 @@ def build_episodes(num_to_build=None):
     print(f"Success: Created {actual_count} clean episodes in 'dev_latest.jsonl' (Skipped {limit - actual_count} leaks)")
 
 if __name__ == "__main__":
-    build_episodes()
+    build_episodes(589)

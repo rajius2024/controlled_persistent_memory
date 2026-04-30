@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
 from collections import Counter
@@ -62,6 +63,15 @@ class ControlledMethod:
         self.reset_episode_run_dir = reset_episode_run_dir
         self.last_trace: dict[str, Any] | None = None
 
+        self.ablation = os.environ.get("CONTROLLED_ABLATION", "full").strip().lower()
+        valid_ablations = {"full", "no_bm25", "no_options", "no_superseded"}
+        if self.ablation not in valid_ablations:
+            raise ValueError(
+                f"Unsupported CONTROLLED_ABLATION={self.ablation!r}. "
+                f"Expected one of {sorted(valid_ablations)}."
+            )
+        print(f"[controlled] ablation={self.ablation}", flush=True)
+
     def answer(self, ep: dict):
         trace = self.answer_with_trace(ep)
         self.last_trace = trace
@@ -103,7 +113,10 @@ class ControlledMethod:
         )
 
         question_type = episode.get("question_type", "")
-        if question_type in EVOLUTION_QUESTION_TYPES:
+        if (
+            question_type in EVOLUTION_QUESTION_TYPES
+            and self.ablation != "no_superseded"
+        ):
             superseded_memories = store.list_memories(
                 persona_id=persona_id,
                 status=MemoryStatus.SUPERSEDED.value,
@@ -143,6 +156,7 @@ class ControlledMethod:
             "top_k": self.top_k,
             "question_type": question_type,
             "topic": episode.get("topic", ""),
+            "ablation": self.ablation,
         }
 
         log_retrieval_event(
@@ -580,23 +594,29 @@ class ControlledMethod:
         )
         dense_active_rows = sorted(dense_active_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
-        bm25_active_records = self._bm25_retrieve(filtered_active, query=query, k=20)
-        bm25_active_rows = self._scored_candidates(
-            bm25_active_records,
-            query=query,
-            cache_key_prefix=f"controlled_bm25_active_{episode.get('question_id', episode.get('episode_id'))}",
-            episode=episode,
-        )
-        bm25_active_rows = sorted(bm25_active_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
+        if self.ablation == "no_bm25":
+            bm25_active_rows = []
+        else:
+            bm25_active_records = self._bm25_retrieve(filtered_active, query=query, k=20)
+            bm25_active_rows = self._scored_candidates(
+                bm25_active_records,
+                query=query,
+                cache_key_prefix=f"controlled_bm25_active_{episode.get('question_id', episode.get('episode_id'))}",
+                episode=episode,
+            )
+            bm25_active_rows = sorted(bm25_active_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
-        option_rows = self._option_conditioned_rows(
-            filtered_active,
-            question=question,
-            options=options,
-            episode=episode,
-            per_option_k=4,
-        )
-        option_rows = sorted(option_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
+        if self.ablation == "no_options":
+            option_rows = []
+        else:
+            option_rows = self._option_conditioned_rows(
+                filtered_active,
+                question=question,
+                options=options,
+                episode=episode,
+                per_option_k=4,
+            )
+            option_rows = sorted(option_rows, key=lambda r: (r["score"], r["memory"].memory_id), reverse=True)
 
         temporal_pool = filtered_active + filtered_superseded if focus_mode == "timeline" else filtered_active
         temporal_rows = self._scored_candidates(

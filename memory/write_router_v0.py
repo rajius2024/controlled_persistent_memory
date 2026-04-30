@@ -7,9 +7,10 @@ import re
 import time
 from functools import lru_cache
 from typing import Any
+from pathlib import Path
 
 import numpy as np
-import requests
+from groq import Groq
 
 from baselines.embeddings import embed_one
 from memory.schema import MemoryRecord, MemoryStatus
@@ -286,27 +287,55 @@ def compute_specificity_score(canonical_text: str, slot: str) -> float:
     return 1.0 - sim
 
 
-class LocalWriteGate:
+class GroqWriteGate:
     def __init__(
         self,
         model_name: str | None = None,
-        max_completion_tokens: int = 96,
-        base_url: str | None = None,
+        max_completion_tokens: int = 64,
         api_key: str | None = None,
     ):
         self.model_name = model_name or os.environ.get(
             "WRITE_GATE_MODEL",
-            "/scratch/vnaruvan/models/llama31_8b_instruct_pinned",
+            "llama-3.3-70b-versatile",
         )
-        self.base_url = base_url or os.environ.get(
-            "WRITE_GATE_BASE_URL",
-            "http://127.0.0.1:8000/v1/chat/completions",
-        )
-        self.api_key = api_key or os.environ.get("WRITE_GATE_API_KEY", "local-token")
+        print(f"[write_gate] loading model: {self.model_name}", flush=True)
+
+        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
+        if not resolved_key:
+            raise ValueError("GROQ_API_KEY is not set.")
+
+        self.client = Groq(api_key=resolved_key)
         self.max_completion_tokens = max_completion_tokens
         self.cache: dict[str, list[dict[str, Any]]] = {}
 
-        print(f"[write_gate] loading local model: {self.model_name}", flush=True)
+        cache_root = os.environ.get("WRITE_GATE_CACHE_DIR", "cache/write_gate_old72")
+        self.cache_dir = Path(cache_root)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[write_gate] disk cache dir: {self.cache_dir}", flush=True)
+
+    def _cache_file(self, cache_key: str) -> Path:
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{digest}.json"
+
+    def _load_disk_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
+        path = self._cache_file(cache_key)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_disk_cache(self, cache_key: str, value: list[dict[str, Any]]) -> None:
+        path = self._cache_file(cache_key)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(value, f, ensure_ascii=False)
+            tmp_path.replace(path)
+        except Exception:
+            pass
 
     def _extract_json_text(self, text: str) -> str:
         text = text.strip()
@@ -317,31 +346,32 @@ class LocalWriteGate:
         return text[start : end + 1]
 
     def extract_candidates(self, utterance: str) -> list[dict[str, Any]]:
-        cache_key = f"{self.model_name}||{self.max_completion_tokens}||{utterance.strip()}"
+        cache_key = (
+            f"model={self.model_name}"
+            f"||max_tokens={self.max_completion_tokens}"
+            f"||prompt_v=write_gate_old72_v1"
+            f"||utterance={utterance.strip()}"
+        )
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        resp = requests.post(
-            self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model_name,
-                "messages": [
-                    {"role": "system", "content": WRITE_GATE_PROMPT},
-                    {"role": "user", "content": utterance},
-                ],
-                "temperature": 0.0,
-                "max_tokens": self.max_completion_tokens,
-            },
-            timeout=180,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        disk_cached = self._load_disk_cache(cache_key)
+        if disk_cached is not None:
+            self.cache[cache_key] = disk_cached
+            return disk_cached
 
-        raw = data["choices"][0]["message"]["content"].strip()
+        completion = self.client.chat.completions.create(
+            model=self.model_name,
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_completion_tokens=self.max_completion_tokens,
+            messages=[
+                {"role": "system", "content": WRITE_GATE_PROMPT},
+                {"role": "user", "content": utterance},
+            ],
+        )
+
+        raw = completion.choices[0].message.content.strip()
         print(f"[write_gate][raw] {raw}", flush=True)
 
         try:
@@ -349,11 +379,13 @@ class LocalWriteGate:
             parsed = json.loads(raw_json)
         except Exception:
             self.cache[cache_key] = []
+            self._save_disk_cache(cache_key, [])
             return []
 
         items = parsed.get("items", [])
         if not isinstance(items, list):
             self.cache[cache_key] = []
+            self._save_disk_cache(cache_key, [])
             return []
 
         cleaned: list[dict[str, Any]] = []
@@ -388,23 +420,24 @@ class LocalWriteGate:
                     "target_kind": target_kind,
                     "polarity": polarity,
                     "memory_type": memory_type,
-                    "extraction_reason": "local_write_gate",
+                    "extraction_reason": "groq_write_gate",
                     "update_hint": bool(item.get("update_hint", False)),
                     "confidence": 1.0,
                 }
             )
 
         self.cache[cache_key] = cleaned
+        self._save_disk_cache(cache_key, cleaned)
         return cleaned
 
 
-_GATE: LocalWriteGate | None = None
+_GATE: GroqWriteGate | None = None
 
 
-def _get_gate() -> LocalWriteGate:
+def _get_gate() -> GroqWriteGate:
     global _GATE
     if _GATE is None:
-        _GATE = LocalWriteGate()
+        _GATE = GroqWriteGate()
     return _GATE
 
 

@@ -2,29 +2,28 @@
 Shared LLM Utility
 ==================
 Single call_llm() used by ALL methods and eval scripts.
-Runs against a local pinned open-source model served on Sol.
 """
 
 import os
 import re
 import time
 
-import requests
+from groq import Groq
 
-MODEL = os.environ.get(
-    "LOCAL_LLM_MODEL",
-    "/scratch/vnaruvan/models/llama31_8b_instruct_pinned",
-)
-BASE_URL = os.environ.get(
-    "LOCAL_LLM_BASE_URL",
-    "http://127.0.0.1:8000/v1/chat/completions",
-)
-API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "local-token")
-
-MAX_TOKENS = 16
+MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+MAX_TOKENS = 12
 TEMPERATURE = 0.0
 MAX_RETRIES = 4
 RATE_LIMIT_SLEEP = 5.0
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    return _client
 
 
 def normalize_label(text: str) -> str:
@@ -56,31 +55,28 @@ def call_llm(prompt: str, system: str = None) -> str:
             "Do not return any other text."
         )
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+
     last_content = ""
 
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.post(
-                BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": TEMPERATURE,
-                    "max_tokens": MAX_TOKENS,
-                },
-                timeout=180,
+            resp = _get_client().chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
             )
-            resp.raise_for_status()
-            data = resp.json()
 
-            content = (data["choices"][0]["message"]["content"] or "").strip()
+            if not resp or not getattr(resp, "choices", None):
+                print("[LLM ERROR] Empty response object")
+                time.sleep(1.0 * (attempt + 1))
+                continue
+
+            content = (resp.choices[0].message.content or "").strip()
             last_content = content
 
             if not content:
@@ -96,15 +92,18 @@ def call_llm(prompt: str, system: str = None) -> str:
 
         except Exception as e:
             err = str(e)
-            print(f"[DEBUG] Exception type: {type(e).__name__}, message: {err[:200]}")
+            print(f"[DEBUG] Exception type: {type(e)._name_}, message: {err[:200]}")
 
-            if "429" in err or "rate_limit" in err.lower():
+            if "413" in err or "429" in err or "rate_limit" in err.lower():
                 wait = 15 * (attempt + 1)
                 print(f"[RATE LIMIT] Waiting {wait}s... (attempt {attempt + 1}/{MAX_RETRIES})")
                 time.sleep(wait)
+            elif "401" in err:
+                print("[AUTH ERROR] Set GROQ_API_KEY with: export GROQ_API_KEY=...")
+                return ""
             else:
-                print(f"[LLM ERROR] {type(e).__name__}: {e}")
-                time.sleep(1.0 * (attempt + 1))
+                print(f"[LLM ERROR] {type(e)._name_}: {e}")
+                return ""
 
     print(f"[FAILED] All {MAX_RETRIES} retries exhausted. Last content={last_content!r}")
     return last_content
